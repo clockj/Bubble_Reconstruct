@@ -15,7 +15,11 @@ from .reconstruction import (
     run_full_reconstruction,
     run_reconstruction_frames_parallel,
 )
-from .visualization import show_reconstruction_comparison_interactive, show_reconstruction_interactive
+from .visualization import (
+    show_mesh_comparison_interactive,
+    show_reconstruction_comparison_interactive,
+    show_reconstruction_interactive,
+)
 from .writers import write_reconstruction
 
 __all__ = [
@@ -36,6 +40,7 @@ __all__ = [
     "run_full_reconstruction_improved",
     "run_reconstruction_frames_parallel",
     "run_reconstruction_frames_parallel_improved",
+    "show_mesh_comparison_interactive",
     "show_reconstruction_comparison_interactive",
     "show_reconstruction_interactive",
     "write_reconstruction",

@@ -5,6 +5,12 @@ from .reconstruction import (
     run_full_reconstruction_improved,
     run_reconstruction_frames_parallel_improved,
 )
+from .spherical_harmonics import (
+    SphericalHarmonicFitConfig,
+    SphericalHarmonicSurface,
+    fit_spherical_harmonic_surface,
+    fit_spherical_harmonic_surface_from_voxels,
+)
 from .surface import (
     LaplacianSmoothingConfig,
     MeshSmoothingConfig,
@@ -16,9 +22,13 @@ from .surface import (
 __all__ = [
     "SoftVisualHullConfig",
     "ImprovedReconstructionConfig",
+    "SphericalHarmonicFitConfig",
+    "SphericalHarmonicSurface",
     "LaplacianSmoothingConfig",
     "MeshSmoothingConfig",
     "create_visual_hull_soft",
+    "fit_spherical_harmonic_surface",
+    "fit_spherical_harmonic_surface_from_voxels",
     "laplacian_smooth_mesh",
     "surface_mesh_from_voxels",
     "taubin_smooth_mesh",

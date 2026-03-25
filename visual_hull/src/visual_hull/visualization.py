@@ -100,6 +100,41 @@ def _draw_reconstruction(
     axis.legend(loc="upper right")
 
 
+def _draw_mesh_collection(
+    axis,
+    meshes: Sequence[tuple[np.ndarray, np.ndarray]],
+    *,
+    title: str,
+    alpha: float,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    colors = plt.cm.tab10(np.linspace(0.0, 1.0, max(len(meshes), 1), endpoint=False))
+    all_points: list[np.ndarray] = []
+
+    for index, (vertices, faces) in enumerate(meshes):
+        vertex_array = np.asarray(vertices, dtype=np.float64)
+        face_array = np.asarray(faces, dtype=np.int64)
+        if vertex_array.size == 0 or face_array.size == 0:
+            continue
+        tris = vertex_array[face_array]
+        collection = Poly3DCollection(tris, alpha=alpha, facecolor=colors[index % len(colors)], edgecolor="none")
+        axis.add_collection3d(collection)
+        axis.plot([], [], color=colors[index % len(colors)], label=f"Surface {index + 1}")
+        all_points.append(vertex_array)
+
+    if all_points:
+        points = np.vstack(all_points)
+        _set_equal_axes(axis, points, np.array([0.6, 0.6, 0.6], dtype=np.float64))
+
+    axis.set_xlabel("X [mm]")
+    axis.set_ylabel("Y [mm]")
+    axis.set_zlabel("Z [mm]")
+    axis.set_title(title)
+    if all_points:
+        axis.legend(loc="upper right")
+
+
 def show_reconstruction_interactive(
     result: FullReconstructionResult,
     *,
@@ -173,6 +208,43 @@ def show_reconstruction_comparison_interactive(
             alpha=alpha,
             title=label,
         )
+
+    figure.tight_layout()
+    if save_path is not None:
+        output_path = Path(save_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(output_path, dpi=200, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(figure)
+
+
+def show_mesh_comparison_interactive(
+    mesh_groups: Sequence[tuple[str, Sequence[tuple[np.ndarray, np.ndarray]]]],
+    *,
+    alpha: float = 0.8,
+    title: str | None = None,
+    save_path: str | Path | None = None,
+    show: bool = True,
+) -> None:
+    _ensure_qt_backend()
+
+    import matplotlib.pyplot as plt
+
+    groups = [(label, list(meshes)) for label, meshes in mesh_groups]
+    if len(groups) < 2:
+        raise ValueError("At least two mesh groups are required for comparison visualization.")
+
+    figure = plt.figure(figsize=(8.0 * len(groups), 8))
+    if title is not None:
+        figure.suptitle(title)
+
+    for index, (label, meshes) in enumerate(groups, start=1):
+        if not meshes:
+            raise ValueError(f"Mesh group {label!r} is empty and cannot be visualized.")
+        axis = figure.add_subplot(1, len(groups), index, projection="3d")
+        _draw_mesh_collection(axis, meshes, title=label, alpha=alpha)
 
     figure.tight_layout()
     if save_path is not None:
