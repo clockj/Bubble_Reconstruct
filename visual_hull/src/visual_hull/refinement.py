@@ -5,17 +5,7 @@ from scipy import ndimage
 
 from .camera import OpenLPTCameraSet
 from .hull import vote_visual_hull_for_points
-
-
-def _points_from_mask(grid_x: np.ndarray, grid_y: np.ndarray, grid_z: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    flat_mask = np.ravel(mask, order="F")
-    return np.column_stack(
-        (
-            np.ravel(grid_x, order="F")[flat_mask],
-            np.ravel(grid_y, order="F")[flat_mask],
-            np.ravel(grid_z, order="F")[flat_mask],
-        )
-    ).astype(np.float64, copy=False)
+from .surface_utils import points_from_mask
 
 
 def find_surface_components(
@@ -35,7 +25,7 @@ def find_surface_components(
         mask = labeled == label_id
         if not np.any(mask):
             continue
-        components.append(_points_from_mask(grid_x, grid_y, grid_z, mask))
+        components.append(points_from_mask(grid_x, grid_y, grid_z, mask))
     return components
 
 
