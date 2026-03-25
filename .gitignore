@@ -2,3 +2,5 @@
 **/.github/
 **/.vscode/
 **/test/
+**/build/
+**/*.egg-info/

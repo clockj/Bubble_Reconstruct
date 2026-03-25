@@ -40,6 +40,7 @@ The current implementation includes:
 - `refinement.py` ports the surface-component separation and local refinement flow from `Reconstruction.m` and `mesh_expand.m`
 - `properties.py` ports `GetBubbleProps.m`
 - `reconstruction.py` orchestrates the full translated pipeline
+- `visualization.py` opens an interactive Matplotlib Qt window for reconstructed bubble geometry
 - `writers.py` exports reconstruction results to MATLAB `.mat` or HDF5 `.h5/.hdf5`
 
 ## Export
@@ -64,3 +65,17 @@ Recommendation:
 - `scripts/export_frame0.py` writes both `.mat` and `.h5` exports for frame 0.
 - All generated test outputs are now written under `test/YYYYMMDD-HHMMSS-<name>/` with `report.json` and `report.md`, following `.github/copilot-instructions.md`.
 - Current frame-0 status: voxel count, bubble count, property shape, and bubble properties match the MATLAB reference; voxel coordinates match within floating-point tolerance.
+
+## Interactive Visualization
+
+Use the provided script to open the reconstructed bubble in an interactive Qt-backed Matplotlib window:
+
+```powershell
+python scripts/visualize_frame.py --frame 0
+```
+
+Notes:
+
+- The viewer uses Matplotlib's `QtAgg` backend with `PySide6`, which is already compatible with the current environment.
+- Mouse rotation, pan, and zoom work in the opened 3D window.
+- `--mode surface` renders a triangulated surface from the voxel occupancy; `--mode scatter` renders the voxel centers directly.
