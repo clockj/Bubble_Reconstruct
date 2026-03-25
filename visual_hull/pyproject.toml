@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "visual-hull"
+version = "0.1.0"
+description = "Python port of the MATLAB bubble visual hull reconstruction pipeline."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=2.0",
+  "scipy>=1.11",
+  "scikit-image>=0.24",
+  "matplotlib>=3.8",
+  "tifffile>=2024.0",
+  "h5py>=3.10",
+  "openlpt>=2.2.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

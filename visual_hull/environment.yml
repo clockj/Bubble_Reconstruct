@@ -1,0 +1,14 @@
+name: bubble-visual-hull
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - scikit-image
+  - matplotlib
+  - tifffile
+  - h5py
+  - pip
+  - pip:
+      - openlpt
