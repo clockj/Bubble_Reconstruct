@@ -53,6 +53,23 @@ def vote_visual_hull(
     return np.column_stack((voxel_grid.voxels, votes.astype(np.float64)))
 
 
+def vote_visual_hull_for_points(
+    masks: list[np.ndarray],
+    points: np.ndarray,
+    cameras: OpenLPTCameraSet,
+) -> np.ndarray:
+    point_array = np.asarray(points, dtype=np.float64)
+    if len(masks) != cameras.count:
+        raise ValueError("The number of masks must match the number of cameras.")
+
+    votes = np.zeros(point_array.shape[0], dtype=np.int32)
+    for camera_index, mask in enumerate(masks):
+        projection = cameras.project_points(camera_index, point_array)
+        votes += _sample_mask(mask, projection.pixels, projection.valid).astype(np.int32)
+
+    return np.column_stack((point_array, votes.astype(np.float64)))
+
+
 def create_visual_hull(
     masks: list[np.ndarray],
     cameras: OpenLPTCameraSet,

@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
-from scipy.io import loadmat, savemat
+from scipy.io import loadmat
 
 
 def frame_key(frame: int) -> str:
@@ -23,14 +23,6 @@ def load_camera_mask(camera_mat_path: str | Path, frame: int) -> np.ndarray:
 def load_camera_masks(data_dir: str | Path, frame: int, num_cameras: int) -> list[np.ndarray]:
     directory = Path(data_dir)
     return [load_camera_mask(directory / f"Cam{camera_index}.mat", frame) for camera_index in range(1, num_cameras + 1)]
-
-
-def save_reconstruction(output_path: str | Path, payload: dict) -> None:
-    output_file = Path(output_path)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    savemat(output_file, payload)
-
-
 def discover_camera_files(folder: str | Path, pattern: str = "C*P.txt") -> list[Path]:
     return sorted(Path(folder).glob(pattern))
 
