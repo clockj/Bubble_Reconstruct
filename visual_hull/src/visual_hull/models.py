@@ -45,3 +45,12 @@ class FullReconstructionResult:
 
     def to_hdf5_payload(self) -> dict[str, np.ndarray | bool]:
         return self.to_matlab_payload()
+
+
+@dataclass(slots=True)
+class FrameExportResult:
+    frame: int
+    output_path: Path
+    voxel_count: int
+    bubble_count: int
+    completed: bool

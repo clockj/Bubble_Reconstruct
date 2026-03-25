@@ -6,6 +6,7 @@ dependencies:
   - numpy
   - scipy
   - scikit-image
+  - joblib
   - matplotlib
   - pyside6
   - tifffile

@@ -40,6 +40,7 @@ The current implementation includes:
 - `refinement.py` ports the surface-component separation and local refinement flow from `Reconstruction.m` and `mesh_expand.m`
 - `properties.py` ports `GetBubbleProps.m`
 - `reconstruction.py` orchestrates the full translated pipeline
+- `reconstruction.py` also provides frame-level parallel batch reconstruction, matching the MATLAB `parfor` structure
 - `visualization.py` opens an interactive Matplotlib Qt window for reconstructed bubble geometry
 - `writers.py` exports reconstruction results to MATLAB `.mat` or HDF5 `.h5/.hdf5`
 
@@ -57,6 +58,39 @@ Recommendation:
 - Use `.mat` if the immediate consumer is MATLAB or if you want exact compatibility with the existing `Bubble_Frame_*.mat` workflow.
 - Use `.h5` for new Python-first pipelines, multi-frame datasets, or larger exports where compression and explicit metadata matter.
 - If you need both ecosystems, write both formats from the same result object; the package now supports that directly.
+
+## Parallel Reconstruction
+
+The Python port now supports frame-level parallel reconstruction, which is the same level of parallelism used by MATLAB `parfor` in the original workflow.
+
+Use `run_reconstruction_frames_parallel(...)` when frames are independent and you want one output file per frame.
+
+Example:
+
+```python
+from pathlib import Path
+
+from visual_hull import build_inputs, run_reconstruction_frames_parallel
+
+inputs = build_inputs(
+	data_dir=Path("../../Islam_0207"),
+	calibration_dir=Path("../../Islam_0207"),
+	frame=0,
+	num_cameras=3,
+	voxel_size=[0.3, 0.3, 0.3],
+	limits=[10, 30, -5, 5, -5, 5],
+)
+
+results = run_reconstruction_frames_parallel(
+	inputs,
+	frames=[0, 1, 2],
+	output_dir=Path("outputs"),
+	export_format="h5",
+	max_workers=3,
+)
+```
+
+Each frame is reconstructed in a separate process through `joblib` and saved as `Bubble_Frame_000000.mat` or `Bubble_Frame_000000.h5` depending on the selected export format.
 
 ## Validation
 

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
+from joblib import Parallel, cpu_count, delayed
 
 from .camera import OpenLPTCameraSet
 from .hull import VisualHullResult, create_visual_hull
 from .io import discover_camera_files, load_camera_masks, stack_boolean_images
-from .models import FullReconstructionResult, ReconstructionInputs
+from .models import FrameExportResult, FullReconstructionResult, ReconstructionInputs
 from .properties import get_bubble_props
 from .refinement import find_surface_components, refine_surface_points
+from .writers import ExportFormat, write_reconstruction
 
 
 def build_inputs(
@@ -136,3 +140,68 @@ def run_full_reconstruction(inputs: ReconstructionInputs) -> FullReconstructionR
         completed=True,
         coarse_result=coarse_result,
     )
+
+
+def _frame_output_suffix(export_format: ExportFormat) -> str:
+    if export_format == "mat":
+        return ".mat"
+    if export_format in {"h5", "hdf5"}:
+        return ".h5"
+    raise ValueError("Batch frame reconstruction requires an explicit export format of 'mat', 'h5', or 'hdf5'.")
+
+
+def _run_and_write_frame(
+    frame: int,
+    inputs: ReconstructionInputs,
+    output_dir: Path,
+    export_format: ExportFormat,
+    compression: str | None,
+) -> FrameExportResult:
+    frame_inputs = replace(inputs, frame=int(frame))
+    result = run_full_reconstruction(frame_inputs)
+    output_path = output_dir / f"Bubble_Frame_{frame:06d}{_frame_output_suffix(export_format)}"
+    write_reconstruction(result, output_path, export_format=export_format, compression=compression)
+    return FrameExportResult(
+        frame=int(frame),
+        output_path=output_path,
+        voxel_count=int(result.voxels.shape[0]),
+        bubble_count=int(result.bubbles.shape[1]) if result.bubbles.ndim == 2 else 0,
+        completed=bool(result.completed),
+    )
+
+
+def run_reconstruction_frames_parallel(
+    inputs: ReconstructionInputs,
+    frames: Sequence[int],
+    output_dir: str | Path,
+    *,
+    export_format: ExportFormat = "mat",
+    max_workers: int | None = None,
+    compression: str | None = "gzip",
+) -> list[FrameExportResult]:
+    frame_list = [int(frame) for frame in frames]
+    if not frame_list:
+        return []
+    if export_format == "auto":
+        raise ValueError("run_reconstruction_frames_parallel requires an explicit export format.")
+
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+
+    worker_count = max_workers
+    if worker_count is None:
+        worker_count = min(len(frame_list), cpu_count())
+    worker_count = max(1, min(int(worker_count), len(frame_list)))
+
+    if worker_count == 1:
+        return [
+            _run_and_write_frame(frame, inputs, destination, export_format, compression)
+            for frame in frame_list
+        ]
+
+    results = Parallel(n_jobs=worker_count, prefer="processes")(
+        delayed(_run_and_write_frame)(frame, inputs, destination, export_format, compression)
+        for frame in frame_list
+    )
+
+    return sorted(results, key=lambda item: item.frame)
