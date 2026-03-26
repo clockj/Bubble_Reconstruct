@@ -107,7 +107,7 @@ def main() -> None:
     baseline_mask_metrics = summarize_mask_overlap(project_meshes_to_camera_masks(baseline_meshes, masks, cameras), masks)
     improved_mask_metrics = summarize_mask_overlap(project_meshes_to_camera_masks(improved_meshes, masks, cameras), masks)
 
-    degree_values = [2, 3, 4, 5, 6]
+    degree_values = [2, 3, 4, 5, 6, 8, 10, 12, 14, 16]
     regularization_values = [1e-4, 1e-3, 1e-2, 1e-1]
     records: list[dict[str, float | int]] = []
 

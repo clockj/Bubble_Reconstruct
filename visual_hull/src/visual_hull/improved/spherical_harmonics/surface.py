@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from math import pi
 
 import numpy as np
+from ...camera import OpenLPTCameraSet
+from ...silhouette_metrics import project_meshes_to_camera_masks, summarize_mask_overlap
 try:
     from scipy.special import sph_harm as _complex_spherical_harmonic
 
@@ -26,6 +28,12 @@ class SphericalHarmonicFitConfig:
     theta_samples: int = 40
     phi_samples: int = 80
     minimum_radius: float = 1e-3
+    silhouette_enabled: bool = False
+    silhouette_weight: float = 0.0
+    silhouette_max_passes: int = 0
+    silhouette_step_scale: float = 0.05
+    silhouette_top_k: int = 12
+    coefficient_drift_weight: float = 0.1
 
     def to_dict(self) -> dict[str, float | int]:
         return {
@@ -34,6 +42,12 @@ class SphericalHarmonicFitConfig:
             "theta_samples": int(self.theta_samples),
             "phi_samples": int(self.phi_samples),
             "minimum_radius": float(self.minimum_radius),
+            "silhouette_enabled": bool(self.silhouette_enabled),
+            "silhouette_weight": float(self.silhouette_weight),
+            "silhouette_max_passes": int(self.silhouette_max_passes),
+            "silhouette_step_scale": float(self.silhouette_step_scale),
+            "silhouette_top_k": int(self.silhouette_top_k),
+            "coefficient_drift_weight": float(self.coefficient_drift_weight),
         }
 
 
@@ -45,6 +59,9 @@ class SphericalHarmonicSurface:
     vertices: np.ndarray
     faces: np.ndarray
     fit_rmse: float
+    silhouette_iou: float | None = None
+    objective_value: float | None = None
+    evaluation_count: int = 0
 
 
 def _cartesian_to_spherical(points: np.ndarray, center: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -91,6 +108,113 @@ def _fit_coefficients(design: np.ndarray, radius: np.ndarray, regularization: fl
     augmented_radius = np.concatenate((radius, np.zeros(design.shape[1], dtype=np.float64)))
     coefficients, *_ = np.linalg.lstsq(augmented_design, augmented_radius, rcond=None)
     return coefficients.astype(np.float64, copy=False)
+
+
+def _coefficient_indices_for_refinement(coefficients: np.ndarray, top_k: int) -> np.ndarray:
+    if coefficients.size == 0:
+        return np.empty((0,), dtype=np.int64)
+    if top_k <= 0 or top_k >= coefficients.size:
+        return np.arange(coefficients.size, dtype=np.int64)
+    ranking = np.argsort(-np.abs(coefficients))
+    return np.sort(ranking[:top_k].astype(np.int64, copy=False))
+
+
+def _silhouette_objective(
+    coefficients: np.ndarray,
+    *,
+    center: np.ndarray,
+    design: np.ndarray,
+    radius: np.ndarray,
+    initial_coefficients: np.ndarray,
+    terms: list[tuple[int, int]],
+    masks: list[np.ndarray],
+    cameras: OpenLPTCameraSet,
+    config: SphericalHarmonicFitConfig,
+) -> tuple[float, float, float]:
+    fitted_radius = np.maximum(design @ coefficients, float(config.minimum_radius))
+    mesh_rmse = float(np.sqrt(np.mean((fitted_radius - radius) ** 2)))
+    drift_penalty = float(np.mean((coefficients - initial_coefficients) ** 2))
+    vertices, faces = _grid_vertices_faces(center, coefficients, terms, config)
+    predicted_masks = project_meshes_to_camera_masks([(vertices, faces)], masks, cameras)
+    overlap = summarize_mask_overlap(predicted_masks, masks)
+    silhouette_iou = float(overlap["overall"]["iou"])
+    loss = (
+        mesh_rmse
+        + float(config.silhouette_weight) * (1.0 - silhouette_iou)
+        + float(config.coefficient_drift_weight) * drift_penalty
+    )
+    return loss, silhouette_iou, mesh_rmse
+
+
+def _refine_coefficients_with_silhouette(
+    coefficients: np.ndarray,
+    *,
+    center: np.ndarray,
+    design: np.ndarray,
+    radius: np.ndarray,
+    terms: list[tuple[int, int]],
+    masks: list[np.ndarray],
+    cameras: OpenLPTCameraSet,
+    config: SphericalHarmonicFitConfig,
+) -> tuple[np.ndarray, float | None, float | None, int]:
+    if not bool(config.silhouette_enabled):
+        return coefficients, None, None, 0
+    if float(config.silhouette_weight) <= 0.0 or int(config.silhouette_max_passes) <= 0:
+        return coefficients, None, None, 0
+
+    refined = coefficients.astype(np.float64, copy=True)
+    initial = coefficients.astype(np.float64, copy=True)
+    active_indices = _coefficient_indices_for_refinement(refined, int(config.silhouette_top_k))
+    if active_indices.size == 0:
+        return refined, None, None, 0
+
+    radius_scale = max(float(np.mean(radius)), float(config.minimum_radius))
+    step_size = max(radius_scale * float(config.silhouette_step_scale), float(config.minimum_radius))
+    evaluation_count = 0
+
+    best_loss, best_iou, best_rmse = _silhouette_objective(
+        refined,
+        center=center,
+        design=design,
+        radius=radius,
+        initial_coefficients=initial,
+        terms=terms,
+        masks=masks,
+        cameras=cameras,
+        config=config,
+    )
+    evaluation_count += 1
+
+    for _ in range(int(config.silhouette_max_passes)):
+        improved = False
+        for coefficient_index in active_indices:
+            for delta in (step_size, -step_size):
+                candidate = refined.copy()
+                candidate[coefficient_index] += delta
+                loss, silhouette_iou, fit_rmse = _silhouette_objective(
+                    candidate,
+                    center=center,
+                    design=design,
+                    radius=radius,
+                    initial_coefficients=initial,
+                    terms=terms,
+                    masks=masks,
+                    cameras=cameras,
+                    config=config,
+                )
+                evaluation_count += 1
+                if loss + 1e-12 < best_loss:
+                    refined = candidate
+                    best_loss = loss
+                    best_iou = silhouette_iou
+                    best_rmse = fit_rmse
+                    improved = True
+        if not improved:
+            step_size *= 0.5
+            if step_size <= float(config.minimum_radius):
+                break
+
+    return refined, best_iou, best_loss, evaluation_count
 
 
 def _grid_vertices_faces(
@@ -163,6 +287,8 @@ def fit_spherical_harmonic_surface(
     vertices: np.ndarray,
     *,
     config: SphericalHarmonicFitConfig | None = None,
+    masks: list[np.ndarray] | None = None,
+    cameras: OpenLPTCameraSet | None = None,
 ) -> SphericalHarmonicSurface:
     settings = config or SphericalHarmonicFitConfig()
     source_vertices = np.asarray(vertices, dtype=np.float64)
@@ -174,6 +300,20 @@ def fit_spherical_harmonic_surface(
     terms = _basis_terms(settings.max_degree)
     design = _design_matrix(theta, phi, terms)
     coefficients = _fit_coefficients(design, radius, settings.regularization)
+    silhouette_iou: float | None = None
+    objective_value: float | None = None
+    evaluation_count = 0
+    if masks is not None and cameras is not None:
+        coefficients, silhouette_iou, objective_value, evaluation_count = _refine_coefficients_with_silhouette(
+            coefficients,
+            center=center,
+            design=design,
+            radius=radius,
+            terms=terms,
+            masks=[np.asarray(mask, dtype=bool) for mask in masks],
+            cameras=cameras,
+            config=settings,
+        )
     fitted_radius = np.maximum(design @ coefficients, float(settings.minimum_radius))
     fit_rmse = float(np.sqrt(np.mean((fitted_radius - radius) ** 2)))
     fitted_vertices, faces = _grid_vertices_faces(center, coefficients, terms, settings)
@@ -185,6 +325,9 @@ def fit_spherical_harmonic_surface(
         vertices=fitted_vertices,
         faces=faces,
         fit_rmse=fit_rmse,
+        silhouette_iou=silhouette_iou,
+        objective_value=objective_value,
+        evaluation_count=evaluation_count,
     )
 
 
@@ -193,12 +336,14 @@ def fit_spherical_harmonic_surface_from_voxels(
     voxel_size: np.ndarray,
     *,
     config: SphericalHarmonicFitConfig | None = None,
+    masks: list[np.ndarray] | None = None,
+    cameras: OpenLPTCameraSet | None = None,
 ) -> SphericalHarmonicSurface | None:
     mesh = surface_mesh_from_voxels(voxels, voxel_size)
     if mesh is None:
         return None
     vertices, _ = mesh
-    return fit_spherical_harmonic_surface(vertices, config=config)
+    return fit_spherical_harmonic_surface(vertices, config=config, masks=masks, cameras=cameras)
 
 
 __all__ = [
