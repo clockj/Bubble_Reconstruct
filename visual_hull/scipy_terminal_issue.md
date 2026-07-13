@@ -1,1 +1,0 @@
-Terminal-based execution in the dedicated visual hull environment currently fails on `import scipy` with no Python traceback, while plain Python and file reads work. This blocks terminal-driven MAT-file validation and suggests an interpreter/runtime issue specific to the shell path, not the Python source files.
