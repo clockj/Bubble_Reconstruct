@@ -38,6 +38,103 @@ def build_inputs(
     )
 
 
+def run_full_reconstruction_from_data(
+    masks: list[np.ndarray],
+    cameras: OpenLPTCameraSet,
+    voxel_size: np.ndarray | list[float],
+    limits: np.ndarray | list[float],
+    *,
+    num_cameras: int | None = None,
+    resolution: np.ndarray | None = None,
+) -> FullReconstructionResult:
+    """Run the full reconstruction pipeline with pre-loaded masks and cameras.
+
+    This is the same as :func:`run_full_reconstruction` but accepts data
+    directly instead of loading from disk.  Useful when masks come from
+    TIFF files or other non-MATLAB sources.
+    """
+    _voxel_size = np.asarray(voxel_size, dtype=np.float64)
+    _limits = np.asarray(limits, dtype=np.float64)
+    _num_cameras = num_cameras if num_cameras is not None else cameras.count
+
+    coarse_result = create_visual_hull(
+        masks=masks,
+        cameras=cameras,
+        voxel_size=_voxel_size,
+        limits=_limits,
+    )
+    real_images = stack_boolean_images(masks)
+    fine_voxel_size = _voxel_size / 3.0
+
+    if int(np.sum(coarse_result.voxel_volume)) <= 0:
+        return FullReconstructionResult(
+            voxel_size=_voxel_size,
+            voxel_size_2=fine_voxel_size,
+            limits=_limits,
+            real_images=real_images,
+            voxels=np.empty((0, 3), dtype=np.float64),
+            bubbles=np.empty((2, 0), dtype=np.int64),
+            properties=np.empty((0, 15), dtype=np.float64),
+            completed=True,
+            coarse_result=coarse_result,
+        )
+
+    surface_components = find_surface_components(
+        coarse_result.voxel_volume,
+        coarse_result.grid_x,
+        coarse_result.grid_y,
+        coarse_result.grid_z,
+    )
+
+    all_voxels: list[np.ndarray] = []
+    bubbles: list[tuple[int, int]] = []
+    properties: list[np.ndarray] = []
+    count = 0
+
+    image_resolution = resolution
+    if image_resolution is None:
+        image_resolution = np.array([real_images.shape[1], real_images.shape[0]], dtype=np.float64)
+
+    for surface_points in surface_components:
+        refined_points = refine_surface_points(
+            surface_points,
+            coarse_voxel_size=_voxel_size,
+            masks=masks,
+            cameras=cameras,
+            mv=2,
+            res_inc=3,
+        )
+        voxel_list, props = get_bubble_props(
+            refined_points,
+            voxel_size=fine_voxel_size,
+            image_resolution=image_resolution,
+            num_cameras=_num_cameras,
+            limits=_limits,
+            cameras=cameras,
+            voxels_center=np.mean(surface_points, axis=0),
+        )
+        all_voxels.append(voxel_list)
+        bubbles.append((count + 1, count + voxel_list.shape[0]))
+        properties.append(props)
+        count += voxel_list.shape[0]
+
+    final_voxels = np.vstack(all_voxels) if all_voxels else np.empty((0, 3), dtype=np.float64)
+    bubble_array = np.array(bubbles, dtype=np.int64).T if bubbles else np.empty((2, 0), dtype=np.int64)
+    props_array = np.vstack(properties) if properties else np.empty((0, 15), dtype=np.float64)
+
+    return FullReconstructionResult(
+        voxel_size=_voxel_size,
+        voxel_size_2=fine_voxel_size,
+        limits=_limits,
+        real_images=real_images,
+        voxels=final_voxels,
+        bubbles=bubble_array,
+        properties=props_array,
+        completed=True,
+        coarse_result=coarse_result,
+    )
+
+
 def run_coarse_reconstruction(inputs: ReconstructionInputs) -> VisualHullResult:
     masks = load_camera_masks(inputs.data_dir, inputs.frame, inputs.num_cameras)
     camera_files = discover_camera_files(inputs.calibration_dir)

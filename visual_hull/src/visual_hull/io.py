@@ -53,6 +53,69 @@ def discover_camera_files(folder: str | Path, pattern: str = "C*P.txt") -> list[
     return sorted(Path(folder).glob(pattern))
 
 
+def load_tiff_mask(tiff_path: str | Path) -> np.ndarray:
+    """Load a single TIFF file and convert to a 2D boolean mask.
+
+    Handles RGBA, RGB, and grayscale inputs.  Any non-zero pixel is
+    treated as foreground.
+    """
+    import matplotlib.pyplot as plt
+
+    img = plt.imread(str(tiff_path))
+    if img.ndim == 3 and img.shape[2] >= 3:
+        # RGBA / RGB → grayscale via luminance
+        if img.dtype == np.uint8:
+            img = img.astype(np.float64) / 255.0
+        gray = 0.2989 * img[:, :, 0] + 0.5870 * img[:, :, 1] + 0.1140 * img[:, :, 2]
+    elif img.ndim == 3 and img.shape[2] == 1:
+        gray = img[:, :, 0]
+    else:
+        gray = img
+    return gray > 0.0
+
+
+def load_tiff_masks(
+    mask_dir: str | Path,
+    frame: int,
+    num_cameras: int,
+    *,
+    camera_base: int = 0,
+    name_template: str = "img{frame:06d}.tif",
+    subdir_template: str = "cam{camera}",
+) -> list[np.ndarray]:
+    """Load a single frame of TIFF masks for all cameras.
+
+    Parameters
+    ----------
+    mask_dir:
+        Root directory containing per-camera subdirectories.
+    frame:
+        Frame number to load.
+    num_cameras:
+        Number of cameras.
+    camera_base:
+        Starting camera index (0 for cam0, 1 for Cam1).
+    name_template:
+        Python format string for the TIFF filename.  Receives ``frame``.
+    subdir_template:
+        Python format string for per-camera subdir.  Receives ``camera``.
+
+    Returns
+    -------
+    list of 2D boolean ndarray, one per camera, in camera-index order.
+    """
+    root = Path(mask_dir)
+    masks: list[np.ndarray] = []
+    for cam_idx in range(camera_base, camera_base + num_cameras):
+        subdir = subdir_template.format(camera=cam_idx)
+        fname = name_template.format(frame=frame)
+        path = root / subdir / fname
+        if not path.is_file():
+            raise FileNotFoundError(f"Mask file not found: {path}")
+        masks.append(load_tiff_mask(path))
+    return masks
+
+
 def stack_boolean_images(images: Iterable[np.ndarray]) -> np.ndarray:
     arrays = [np.asarray(image, dtype=bool) for image in images]
     if not arrays:
