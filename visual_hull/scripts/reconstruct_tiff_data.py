@@ -214,6 +214,30 @@ def parse_args() -> argparse.Namespace:
         default=80,
         help="Phi resolution for SH mesh generation.",
     )
+    parser.add_argument(
+        "--sh-min-points-per-coeff",
+        type=float,
+        default=3.0,
+        help=(
+            "Minimum surface points required per SH coefficient. Caps each "
+            "bubble's degree so undersampled fits can't oscillate into "
+            "'flower petals'. Higher = smoother/safer, 0 = disable cap. "
+            "Default 3.0."
+        ),
+    )
+    # ── Size filtering ──────────────────────────────────────────────────────
+    parser.add_argument(
+        "--size-range",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("MIN", "MAX"),
+        help=(
+            "Keep only bubbles whose equivalent diameter (mm) is within "
+            "[MIN, MAX]. D_eq = 2*(3V/4pi)^(1/3). Bubbles outside the range "
+            "are dropped entirely (no voxels, no SH). Default: no filtering."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -333,18 +357,50 @@ def _adapt_sh_degree(n_voxels: int, max_degree: int) -> int:
     return max_degree
 
 
+def _max_supported_sh_degree(
+    n_points: int, max_degree: int, min_points_per_coeff: float
+) -> int:
+    """Largest even SH degree whose coefficients are supported by the data.
+
+    A degree-``L`` fit has ``(L+1)²`` coefficients.  When the number of
+    surface points is comparable to (or below) that, the least-squares
+    system is underdetermined and the fitted radius interpolates the
+    sparse samples while oscillating wildly between them — the "flower
+    petal" artifact (near-zero RMSE, spiky mesh).
+
+    Requiring at least ``min_points_per_coeff`` points per coefficient
+    caps the degree so every retained mode is actually constrained by
+    the data.  ``min_points_per_coeff <= 0`` disables the cap.
+    """
+    if min_points_per_coeff <= 0.0:
+        return max(2, int(max_degree))
+    best = 2
+    for deg in range(2, int(max_degree) + 1, 2):
+        if (deg + 1) ** 2 * float(min_points_per_coeff) <= n_points:
+            best = deg
+        else:
+            break
+    return best
+
+
 def _fit_sh_for_bubbles(
     voxels: np.ndarray,
     bubbles: np.ndarray,
     sh_config: SphericalHarmonicFitConfig,
     *,
     adaptive_degree: bool = True,
+    min_points_per_coeff: float = 3.0,
 ) -> dict | None:
     """Fit spherical harmonics to each bubble's refined voxels.
 
     With ``adaptive_degree=True`` (the default), each bubble gets its own
     SH degree based on how many surface voxels it has.  This prevents
     high-degree oscillations ("flower petals") on sparse bubbles.
+
+    ``min_points_per_coeff`` caps every bubble's degree so each SH
+    coefficient is constrained by at least that many surface points —
+    the primary guard against the flower-petal artifact (applied in both
+    the adaptive and fixed-degree paths).  Set to 0 to disable.
 
     Returns None when there are no bubbles or SH is disabled.
     """
@@ -374,15 +430,21 @@ def _fit_sh_for_bubbles(
         if n_pts < 6:
             continue  # too few points for SH fit
 
+        # ── Degree cap: enough surface points per SH coefficient ─────────
+        # Prevents underdetermined fits that oscillate into "flower petals".
+        degree_cap = _max_supported_sh_degree(
+            n_pts, global_max_degree, min_points_per_coeff
+        )
+
         # ── Parsimonious degree for this bubble ──────────────────────────
         if adaptive_degree:
             bubble_degree = _parsimonious_sh_degree(
                 bubble_voxels,
-                max_degree=global_max_degree,
+                max_degree=degree_cap,
                 regularization=float(sh_config.regularization),
             )
         else:
-            bubble_degree = global_max_degree
+            bubble_degree = min(global_max_degree, degree_cap)
 
         bubble_config = SphericalHarmonicFitConfig(
             max_degree=bubble_degree,
@@ -508,8 +570,15 @@ def reconstruct_single_frame(
     sh_config: SphericalHarmonicFitConfig | None,
     sh_adaptive: bool = True,
     refine_to: float | None = None,
+    size_range: tuple[float, float] | None = None,
+    sh_min_points_per_coeff: float = 3.0,
 ) -> dict:
-    """Reconstruct a single frame and return a result summary dict."""
+    """Reconstruct a single frame and return a result summary dict.
+
+    ``size_range`` — optional ``(min, max)`` equivalent-diameter bounds in
+    mm.  Bubbles whose equivalent diameter falls outside the range are
+    dropped entirely (excluded from voxel output and SH fitting).
+    """
     from visual_hull.hull import create_visual_hull
     from visual_hull.io import stack_boolean_images
     from visual_hull.models import FullReconstructionResult
@@ -593,6 +662,7 @@ def reconstruct_single_frame(
     bubbles: list[tuple[int, int]] = []
     properties: list[np.ndarray] = []
     count = 0
+    filtered_out = 0
 
     for surface_points in surface_components:
         # ── Refinement (multi-level or default) ────────────────────────────
@@ -624,6 +694,15 @@ def reconstruct_single_frame(
             cameras=cameras,
             voxels_center=np.mean(surface_points, axis=0),
         )
+
+        # ── Size-range filter (equivalent diameter, mm) ────────────────────
+        # props[3] is the equal-volume-sphere radius; D_eq = 2 * radius.
+        if size_range is not None:
+            equiv_diameter = 2.0 * float(props[3])
+            if equiv_diameter < size_range[0] or equiv_diameter > size_range[1]:
+                filtered_out += 1
+                continue
+
         all_voxels.append(voxel_list)
         bubbles.append((count + 1, count + voxel_list.shape[0]))
         properties.append(props)
@@ -657,11 +736,18 @@ def reconstruct_single_frame(
         "bubble_count": int(result.bubbles.shape[1]) if result.bubbles.ndim == 2 else 0,
         "completed": bool(result.completed),
         "sh_saved": False,
+        "filtered_out_of_size_range": int(filtered_out),
     }
 
     # ── Spherical Harmonics (optional) ──────────────────────────────────────
     if sh_config is not None and result.bubbles.ndim == 2 and result.bubbles.shape[1] > 0:
-        sh_data = _fit_sh_for_bubbles(result.voxels, result.bubbles, sh_config, adaptive_degree=sh_adaptive)
+        sh_data = _fit_sh_for_bubbles(
+            result.voxels,
+            result.bubbles,
+            sh_config,
+            adaptive_degree=sh_adaptive,
+            min_points_per_coeff=sh_min_points_per_coeff,
+        )
         if sh_data is not None:
             sh_path = output_dir / f"Bubble_Frame_{frame:06d}_sh.mat"
             savemat(str(sh_path), sh_data)
@@ -689,6 +775,16 @@ def main() -> None:
         if args.config_dir
         else working_dir / "config_recon"
     )
+
+    # ── Size-range filter ─────────────────────────────────────────────────
+    size_range: tuple[float, float] | None = None
+    if args.size_range is not None:
+        lo, hi = float(args.size_range[0]), float(args.size_range[1])
+        if lo < 0 or hi <= lo:
+            raise ValueError(
+                f"--size-range must satisfy 0 <= MIN < MAX (got {lo}, {hi})."
+            )
+        size_range = (lo, hi)
 
     # ── SH config ───────────────────────────────────────────────────────────
     sh_config: SphericalHarmonicFitConfig | None = None
@@ -722,7 +818,9 @@ def main() -> None:
         "sh_max_degree": args.sh_degree if sh_config else 0,
         "sh_regularization": args.sh_regularization if sh_config else None,
         "sh_adaptive": sh_adaptive,
+        "sh_min_points_per_coeff": args.sh_min_points_per_coeff,
         "refine_to_mm": args.refine_to,
+        "size_range_mm": list(size_range) if size_range else None,
     }
 
     if args.dry_run:
@@ -742,6 +840,9 @@ def main() -> None:
     print(f"Cameras     : {args.num_cameras}")
     print(f"Workers     : {workers}  (of {_cpu_count()} CPUs)")
     print(f"SH degree   : {args.sh_degree}" + (" (disabled)" if args.sh_degree == 0 else ""))
+    if args.sh_degree > 0:
+        print(f"SH min pts/coeff : {args.sh_min_points_per_coeff}")
+    print(f"Size range  : " + (f"{size_range[0]}–{size_range[1]} mm (equiv. diameter)" if size_range else "no filter"))
     print()
 
     kwargs = dict(
@@ -758,6 +859,8 @@ def main() -> None:
         sh_config=sh_config,
         sh_adaptive=sh_adaptive,
         refine_to=args.refine_to,
+        size_range=size_range,
+        sh_min_points_per_coeff=args.sh_min_points_per_coeff,
     )
 
     if workers > 1:
@@ -799,9 +902,12 @@ def main() -> None:
         total_voxels = sum(r["voxel_count"] for r in completed)
         total_bubbles = sum(r["bubble_count"] for r in completed)
         sh_count = sum(1 for r in completed if r.get("sh_saved"))
+        total_filtered = sum(r.get("filtered_out_of_size_range", 0) for r in completed)
         print(f"Total voxels  : {total_voxels}")
         print(f"Total bubbles : {total_bubbles}")
         print(f"SH fitted     : {sh_count} frames")
+        if size_range is not None:
+            print(f"Filtered out  : {total_filtered} bubbles (outside {size_range[0]}–{size_range[1]} mm)")
 
     summary_path = output_dir / "reconstruction_summary.json"
     with open(summary_path, "w") as fh:
