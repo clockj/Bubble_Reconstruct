@@ -103,6 +103,19 @@ def parse_args() -> argparse.Namespace:
         help="Coarse voxel size in mm.  Default 1.0 mm.",
     )
     parser.add_argument(
+        "--refine-to",
+        type=float,
+        default=None,
+        metavar="MM",
+        help=(
+            "Target refinement voxel size in mm (single value, same for all axes). "
+            "Enables multi-level refinement from coarse voxels down to this size. "
+            "Default: use pipeline built-in refinement (coarse / 3). "
+            "Practical limit: ~0.05 mm (camera pixel footprint). "
+            "Example: --refine-to 0.05"
+        ),
+    )
+    parser.add_argument(
         "--limits",
         type=float,
         nargs=6,
@@ -181,8 +194,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sh-regularization",
         type=float,
-        default=1e-3,
-        help="Tikhonov regularization strength for SH fitting.",
+        default=1e-2,
+        help="Tikhonov regularization strength for SH fitting (higher = smoother).",
+    )
+    parser.add_argument(
+        "--sh-no-adaptive",
+        action="store_true",
+        help="Use fixed SH degree for all bubbles (disable per-bubble adaptive degree).",
     )
     parser.add_argument(
         "--sh-theta-samples",
@@ -231,12 +249,102 @@ def save_config(config: dict, config_dir: Path) -> Path:
     return path
 
 
+def _parsimonious_sh_degree(
+    vertices: np.ndarray,
+    max_degree: int,
+    regularization: float,
+    improvement_threshold: float = 0.05,
+    rmse_floor_mm: float = 0.01,
+) -> int:
+    """Select the minimal SH degree needed to represent a bubble.
+
+    Fits increasing even degrees (2, 4, 6, …) and stops when adding
+    more modes reduces RMSE by less than *improvement_threshold*
+    (default 5 % relative improvement), OR when RMSE is already below
+    *rmse_floor_mm* (default 0.01 mm — far below pixel resolution).
+
+    Falls back to the voxel-count heuristic for very small bubbles
+    (< 20 points).
+    """
+    from visual_hull.improved.spherical_harmonics.surface import (
+        _basis_terms,
+        _cartesian_to_spherical,
+        _design_matrix,
+        _fit_coefficients,
+    )
+
+    pts = np.asarray(vertices, dtype=np.float64)
+    n_pts = pts.shape[0]
+
+    if n_pts < 6:
+        return 2
+    if n_pts < 20:
+        # Very sparse: use voxel-count heuristic
+        return _adapt_sh_degree(n_pts, max_degree)
+
+    center = np.mean(pts, axis=0)
+    radius, theta, phi = _cartesian_to_spherical(pts, center)
+
+    best_degree = 2
+    best_rmse = float("inf")
+    candidate_degrees = list(range(2, int(max_degree) + 1, 2))
+    if not candidate_degrees:
+        return 2
+
+    for deg in candidate_degrees:
+        terms = _basis_terms(deg)
+        design = _design_matrix(theta, phi, terms)
+        coeffs = _fit_coefficients(design, radius, float(regularization))
+        fitted = np.maximum(design @ coeffs, 1e-6)
+        rmse = float(np.sqrt(np.mean((fitted - radius) ** 2)))
+
+        # Stop if we're already below the pixel-resolution floor
+        if rmse <= float(rmse_floor_mm):
+            best_degree = deg
+            break
+
+        if rmse < best_rmse * (1.0 - float(improvement_threshold)):
+            best_degree = deg
+            best_rmse = rmse
+        else:
+            # Improvement too small — stick with previous degree
+            break
+
+    return best_degree
+
+
+def _adapt_sh_degree(n_voxels: int, max_degree: int) -> int:
+    """Choose an appropriate SH degree based on the number of surface voxels.
+
+    Small bubbles with few points can't support high-degree fits — the
+    spherical harmonics oscillate wildly between sparse samples (the
+    "flower petal" problem).  We clamp the degree so there are at least
+    ~10 points per coefficient.
+    """
+    n = int(n_voxels)
+    if max_degree <= 2:
+        return max_degree
+    # Each degree L has 2L+1 coefficients, total = (L+1)²
+    # We want at least 10 points per coefficient
+    for deg in range(2, max_degree + 1, 2):
+        n_coeffs = (deg + 1) ** 2
+        if n < n_coeffs * 10:
+            return max(2, deg - 2)
+    return max_degree
+
+
 def _fit_sh_for_bubbles(
     voxels: np.ndarray,
     bubbles: np.ndarray,
     sh_config: SphericalHarmonicFitConfig,
+    *,
+    adaptive_degree: bool = True,
 ) -> dict | None:
     """Fit spherical harmonics to each bubble's refined voxels.
+
+    With ``adaptive_degree=True`` (the default), each bubble gets its own
+    SH degree based on how many surface voxels it has.  This prevents
+    high-degree oscillations ("flower petals") on sparse bubbles.
 
     Returns None when there are no bubbles or SH is disabled.
     """
@@ -250,57 +358,75 @@ def _fit_sh_for_bubbles(
     sh_vertices: list[np.ndarray] = []
     sh_faces: list[np.ndarray] = []
     sh_fit_rmse: list[float] = []
+    sh_degrees: list[int] = []
+
+    global_max_degree = int(sh_config.max_degree)
+    # Pre-compute the full set of basis terms for the requested max degree
+    from visual_hull.improved.spherical_harmonics.surface import _basis_terms
+    full_terms = _basis_terms(global_max_degree)
 
     for b in range(bubbles.shape[1]):
         start = int(bubbles[0, b]) - 1  # MATLAB 1-indexed → 0-indexed
         end = int(bubbles[1, b])
         bubble_voxels = voxels[start:end, :]
 
-        if bubble_voxels.shape[0] < 4:
+        n_pts = bubble_voxels.shape[0]
+        if n_pts < 6:
             continue  # too few points for SH fit
+
+        # ── Parsimonious degree for this bubble ──────────────────────────
+        if adaptive_degree:
+            bubble_degree = _parsimonious_sh_degree(
+                bubble_voxels,
+                max_degree=global_max_degree,
+                regularization=float(sh_config.regularization),
+            )
+        else:
+            bubble_degree = global_max_degree
+
+        bubble_config = SphericalHarmonicFitConfig(
+            max_degree=bubble_degree,
+            regularization=float(sh_config.regularization),
+            theta_samples=int(sh_config.theta_samples),
+            phi_samples=int(sh_config.phi_samples),
+            minimum_radius=float(sh_config.minimum_radius),
+        )
 
         try:
             sh_surface = fit_spherical_harmonic_surface(
                 bubble_voxels,
-                config=sh_config,
+                config=bubble_config,
                 masks=None,
                 cameras=None,
             )
         except Exception:
             continue
 
+        # Pad coefficients to the global max_degree for uniform storage
+        n_full = (global_max_degree + 1) ** 2
+        n_bubble = sh_surface.coefficients.shape[0]
+        coeffs_padded = np.zeros(n_full, dtype=np.float64)
+        coeffs_padded[:n_bubble] = sh_surface.coefficients
+
         sh_centers.append(sh_surface.center)
-        sh_coefficients.append(sh_surface.coefficients)
-        # store (l,m) pairs as two arrays for easy MATLAB reading
-        terms = np.array(sh_surface.basis_terms, dtype=np.int32)
-        sh_basis_l.append(terms[:, 0])
-        sh_basis_m.append(terms[:, 1])
+        sh_coefficients.append(coeffs_padded)
+        sh_basis_l.append(np.array([t[0] for t in full_terms], dtype=np.int32))
+        sh_basis_m.append(np.array([t[1] for t in full_terms], dtype=np.int32))
         sh_vertices.append(sh_surface.vertices)
         sh_faces.append(sh_surface.faces + 1)  # 0-index → 1-index (MATLAB)
         sh_fit_rmse.append(sh_surface.fit_rmse)
+        sh_degrees.append(bubble_degree)
 
     if not sh_centers:
         return None
 
     return {
-        "sh_max_degree": int(sh_config.max_degree),
+        "sh_max_degree": global_max_degree,
         "sh_num_bubbles": len(sh_centers),
         "sh_centers": np.array(sh_centers, dtype=np.float64),
-        "sh_coefficients": np.array(
-            [np.pad(c, (0, max(len(c) for c in sh_coefficients) - len(c)))
-             for c in sh_coefficients],
-            dtype=np.float64,
-        ),
-        "sh_basis_l": np.array(
-            [np.pad(a, (0, max(len(a) for a in sh_basis_l) - len(a)))
-             for a in sh_basis_l],
-            dtype=np.int32,
-        ),
-        "sh_basis_m": np.array(
-            [np.pad(a, (0, max(len(a) for a in sh_basis_m) - len(a)))
-             for a in sh_basis_m],
-            dtype=np.int32,
-        ),
+        "sh_coefficients": np.array(sh_coefficients, dtype=np.float64),
+        "sh_basis_l": np.array(sh_basis_l, dtype=np.int32),
+        "sh_basis_m": np.array(sh_basis_m, dtype=np.int32),
         "sh_vertices": np.array(
             [np.pad(v, ((0, max(v.shape[0] for v in sh_vertices) - v.shape[0]), (0, 0)))
              for v in sh_vertices],
@@ -312,7 +438,59 @@ def _fit_sh_for_bubbles(
             dtype=np.int32,
         ),
         "sh_fit_rmse": np.array(sh_fit_rmse, dtype=np.float64),
+        "sh_degree_used": np.array(sh_degrees, dtype=np.int32),
     }
+
+
+def _multi_level_refine(
+    surface_points: np.ndarray,
+    coarse_voxel_size: np.ndarray,
+    masks: list[np.ndarray],
+    cameras: OpenLPTCameraSet,
+    target_mm: float,
+) -> np.ndarray:
+    """Refine surface points through multiple levels down to *target_mm*.
+
+    Each level subdivides by ~4-5×.  The coarse level uses a 2-voxel
+    margin; finer levels use a 1-voxel margin.
+
+    Returns refined points at approximately *target_mm* resolution.
+    """
+    from visual_hull.refinement import refine_surface_points
+
+    current = np.asarray(surface_points, dtype=np.float64)
+    current_size = np.asarray(coarse_voxel_size, dtype=np.float64)
+    target = float(target_mm)
+
+    level = 0
+    while True:
+        current_min = float(np.min(current_size))
+        if current_min <= target * 1.01:  # close enough (1% tolerance)
+            break
+
+        # Choose res_inc to step down by ~4-5× per level
+        res_inc = min(5, max(3, int(np.round(current_min / target))))
+        if res_inc < 2:
+            res_inc = 2
+
+        mv = 2 if level == 0 else 1
+        next_size = current_size / float(res_inc)
+
+        current = refine_surface_points(
+            current,
+            coarse_voxel_size=current_size,
+            masks=masks,
+            cameras=cameras,
+            mv=mv,
+            res_inc=res_inc,
+        )
+        current_size = next_size
+        level += 1
+
+        if current.shape[0] == 0:
+            break
+
+    return current
 
 
 def reconstruct_single_frame(
@@ -328,8 +506,16 @@ def reconstruct_single_frame(
     output_dir: Path,
     export_format: str,
     sh_config: SphericalHarmonicFitConfig | None,
+    sh_adaptive: bool = True,
+    refine_to: float | None = None,
 ) -> dict:
     """Reconstruct a single frame and return a result summary dict."""
+    from visual_hull.hull import create_visual_hull
+    from visual_hull.io import stack_boolean_images
+    from visual_hull.models import FullReconstructionResult
+    from visual_hull.properties import get_bubble_props
+    from visual_hull.refinement import find_surface_components
+
     mask_root = working_dir / mask_dir_name
     camera_root = working_dir / camera_dir_name
 
@@ -354,13 +540,109 @@ def reconstruct_single_frame(
 
     cameras = OpenLPTCameraSet.from_camera_files(camera_paths)
 
-    # Run pipeline
-    result = run_full_reconstruction_from_data(
+    # ── Coarse visual hull ─────────────────────────────────────────────────
+    _voxel_size = np.asarray(voxel_size, dtype=np.float64)
+    _limits = np.asarray(limits, dtype=np.float64)
+
+    coarse_result = create_visual_hull(
         masks=masks,
         cameras=cameras,
-        voxel_size=voxel_size,
-        limits=limits,
-        num_cameras=num_cameras,
+        voxel_size=_voxel_size,
+        limits=_limits,
+    )
+    real_images = stack_boolean_images(masks)
+
+    # Determine fine voxel size for properties
+    if refine_to is not None:
+        fine_voxel_size = np.full(3, float(refine_to), dtype=np.float64)
+    else:
+        fine_voxel_size = _voxel_size / 3.0
+
+    if int(np.sum(coarse_result.voxel_volume)) <= 0:
+        result = FullReconstructionResult(
+            voxel_size=_voxel_size,
+            voxel_size_2=fine_voxel_size,
+            limits=_limits,
+            real_images=real_images,
+            voxels=np.empty((0, 3), dtype=np.float64),
+            bubbles=np.empty((2, 0), dtype=np.int64),
+            properties=np.empty((0, 15), dtype=np.float64),
+            completed=True,
+            coarse_result=coarse_result,
+        )
+        suffix = ".mat" if export_format == "mat" else ".h5"
+        output_path = output_dir / f"Bubble_Frame_{frame:06d}{suffix}"
+        write_reconstruction(result, output_path, export_format=export_format)
+        return {
+            "frame": frame, "output": str(output_path),
+            "voxel_count": 0, "bubble_count": 0,
+            "completed": True, "sh_saved": False,
+        }
+
+    # ── Surface components ─────────────────────────────────────────────────
+    surface_components = find_surface_components(
+        coarse_result.voxel_volume,
+        coarse_result.grid_x,
+        coarse_result.grid_y,
+        coarse_result.grid_z,
+    )
+
+    image_resolution = np.array([real_images.shape[1], real_images.shape[0]], dtype=np.float64)
+
+    all_voxels: list[np.ndarray] = []
+    bubbles: list[tuple[int, int]] = []
+    properties: list[np.ndarray] = []
+    count = 0
+
+    for surface_points in surface_components:
+        # ── Refinement (multi-level or default) ────────────────────────────
+        if refine_to is not None:
+            refined_points = _multi_level_refine(
+                surface_points, _voxel_size, masks, cameras,
+                target_mm=refine_to,
+            )
+        else:
+            from visual_hull.refinement import refine_surface_points
+            refined_points = refine_surface_points(
+                surface_points,
+                coarse_voxel_size=_voxel_size,
+                masks=masks,
+                cameras=cameras,
+                mv=2,
+                res_inc=3,
+            )
+
+        if refined_points.shape[0] < 4:
+            continue
+
+        voxel_list, props = get_bubble_props(
+            refined_points,
+            voxel_size=fine_voxel_size,
+            image_resolution=image_resolution,
+            num_cameras=num_cameras,
+            limits=_limits,
+            cameras=cameras,
+            voxels_center=np.mean(surface_points, axis=0),
+        )
+        all_voxels.append(voxel_list)
+        bubbles.append((count + 1, count + voxel_list.shape[0]))
+        properties.append(props)
+        count += voxel_list.shape[0]
+
+    final_voxels = np.vstack(all_voxels) if all_voxels else np.empty((0, 3), dtype=np.float64)
+    bubble_array = np.array(bubbles, dtype=np.int64).T if bubbles else np.empty((2, 0), dtype=np.int64)
+    props_array = np.vstack(properties) if properties else np.empty((0, 15), dtype=np.float64)
+
+    result = FullReconstructionResult(
+        voxel_size=_voxel_size,
+        voxel_size_2=fine_voxel_size,
+        limits=_limits,
+        real_images=real_images,
+        voxels=final_voxels,
+        bubbles=bubble_array,
+        properties=props_array,
+        completed=True,
+        coarse_result=coarse_result,
     )
 
     # Write baseline output
@@ -379,7 +661,7 @@ def reconstruct_single_frame(
 
     # ── Spherical Harmonics (optional) ──────────────────────────────────────
     if sh_config is not None and result.bubbles.ndim == 2 and result.bubbles.shape[1] > 0:
-        sh_data = _fit_sh_for_bubbles(result.voxels, result.bubbles, sh_config)
+        sh_data = _fit_sh_for_bubbles(result.voxels, result.bubbles, sh_config, adaptive_degree=sh_adaptive)
         if sh_data is not None:
             sh_path = output_dir / f"Bubble_Frame_{frame:06d}_sh.mat"
             savemat(str(sh_path), sh_data)
@@ -410,6 +692,7 @@ def main() -> None:
 
     # ── SH config ───────────────────────────────────────────────────────────
     sh_config: SphericalHarmonicFitConfig | None = None
+    sh_adaptive = not args.sh_no_adaptive
     if args.sh_degree > 0:
         sh_config = SphericalHarmonicFitConfig(
             max_degree=args.sh_degree,
@@ -438,6 +721,8 @@ def main() -> None:
         "sh_enabled": sh_config is not None,
         "sh_max_degree": args.sh_degree if sh_config else 0,
         "sh_regularization": args.sh_regularization if sh_config else None,
+        "sh_adaptive": sh_adaptive,
+        "refine_to_mm": args.refine_to,
     }
 
     if args.dry_run:
@@ -471,6 +756,8 @@ def main() -> None:
         output_dir=output_dir,
         export_format=args.format,
         sh_config=sh_config,
+        sh_adaptive=sh_adaptive,
+        refine_to=args.refine_to,
     )
 
     if workers > 1:

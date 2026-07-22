@@ -62,7 +62,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--interactive",
         action="store_true",
-        help="Show interactive 3D windows instead of saving PNGs.",
+        help="Show interactive 3D windows instead of saving files.",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["png", "html"],
+        default="png",
+        help="Output format: png (static) or html (interactive plotly).",
     )
     parser.add_argument(
         "--output-dir",
@@ -161,6 +167,133 @@ def plot_bubble_3d(
         ax.scatter([], [], [], color=color, label=label, s=20)
 
 
+def visualize_frame_html(
+    sh_data: dict,
+    voxel_data: dict | None,
+    frame: int,
+    output_path: Path,
+    show_voxels: bool,
+    title_prefix: str,
+) -> None:
+    """Create an interactive plotly HTML for one frame's bubbles."""
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    num_bubbles = int(np.asarray(sh_data["sh_num_bubbles"]).flat[0])
+    centers = np.asarray(sh_data["sh_centers"])
+    vertices_all = np.asarray(sh_data["sh_vertices"])
+    faces_all = np.asarray(sh_data["sh_faces"], dtype=np.int32)
+    rmse_all = np.asarray(sh_data["sh_fit_rmse"]).flatten()
+    degrees = np.asarray(sh_data.get("sh_degree_used", [[2]] * num_bubbles)).flatten()
+
+    ncols = min(num_bubbles, 3)
+    nrows = int(np.ceil(num_bubbles / ncols))
+
+    # Build subplots: each bubble gets its own 3D scene
+    subplot_specs = [[{"type": "scene"} for _ in range(ncols)] for _ in range(nrows)]
+    fig = make_subplots(
+        rows=nrows, cols=ncols,
+        specs=subplot_specs,
+        subplot_titles=[
+            f"Bubble {i+1} | deg={int(degrees[i]) if i < len(degrees) else '?'}"
+            f" | c=({centers[i,0]:.0f},{centers[i,1]:.0f},{centers[i,2]:.0f})"
+            f" | RMSE={rmse_all[i]:.3f}"
+            if i < num_bubbles else ""
+            for i in range(nrows * ncols)
+        ],
+    )
+
+    colors = ["#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd","#8c564b",
+              "#e377c2","#7f7f7f","#bcbd22","#17becf","#aec7e8","#ffbb78",
+              "#98df8a","#ff9896"]
+
+    for b_idx in range(num_bubbles):
+        row = b_idx // ncols + 1
+        col = b_idx % ncols + 1
+
+        verts = vertices_all[b_idx]   # (V, 3)
+        faces = faces_all[b_idx] - 1  # 1-index → 0-index
+        center = centers[b_idx]
+        color = colors[b_idx % len(colors)]
+
+        # --- SH surface mesh ---
+        fig.add_trace(
+            go.Mesh3d(
+                x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+                i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+                color=color, opacity=0.75,
+                name=f"B{b_idx+1} SH",
+                showlegend=True,
+                hovertemplate=f"Bubble {b_idx+1}<br>x=%{{x:.1f}} y=%{{y:.1f}} z=%{{z:.1f}}<extra></extra>",
+            ),
+            row=row, col=col,
+        )
+
+        # --- Voxel overlay ---
+        if show_voxels and voxel_data is not None:
+            bubbles_arr = voxel_data.get("bubbles")
+            voxels_arr = voxel_data.get("voxels")
+            if bubbles_arr is not None and voxels_arr is not None and b_idx < bubbles_arr.shape[1]:
+                start = int(bubbles_arr[0, b_idx]) - 1
+                end = int(bubbles_arr[1, b_idx])
+                bv = voxels_arr[start:end, :]
+                # Subsample for performance
+                if bv.shape[0] > 5000:
+                    idx = np.random.choice(bv.shape[0], 5000, replace=False)
+                    bv = bv[idx]
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=bv[:, 0], y=bv[:, 1], z=bv[:, 2],
+                        mode="markers",
+                        marker=dict(size=1, color="black", opacity=0.3),
+                        name=f"B{b_idx+1} voxels",
+                        showlegend=True,
+                    ),
+                    row=row, col=col,
+                )
+
+        # --- Center marker ---
+        fig.add_trace(
+            go.Scatter3d(
+                x=[center[0]], y=[center[1]], z=[center[2]],
+                mode="markers",
+                marker=dict(size=4, color="red", symbol="x"),
+                name=f"B{b_idx+1} center",
+                showlegend=False,
+            ),
+            row=row, col=col,
+        )
+
+    # Update layout
+    fig.update_layout(
+        title=dict(
+            text=f"{title_prefix}Frame {frame} — {num_bubbles} bubble(s)",
+            font=dict(size=16),
+        ),
+        height=450 * nrows,
+        width=500 * ncols,
+        showlegend=True,
+    )
+
+    # Set equal aspect for each subplot
+    for b_idx in range(num_bubbles):
+        row = b_idx // ncols + 1
+        col = b_idx % ncols + 1
+        verts = vertices_all[b_idx]
+        mid = np.mean(verts, axis=0)
+        rng = max(np.ptp(verts, axis=0)) * 0.55
+        scene = f"scene{b_idx + 1}" if num_bubbles > 1 else "scene"
+        fig.update_layout(**{
+            f"{scene}.xaxis": dict(range=[mid[0]-rng, mid[0]+rng], title="X"),
+            f"{scene}.yaxis": dict(range=[mid[1]-rng, mid[1]+rng], title="Y"),
+            f"{scene}.zaxis": dict(range=[mid[2]-rng, mid[2]+rng], title="Z"),
+            f"{scene}.aspectmode": "cube",
+        })
+
+    fig.write_html(str(output_path), include_plotlyjs=True, full_html=True)
+    print(f"  Saved → {output_path}")
+
+
 def visualize_frame(
     sh_data: dict,
     voxel_data: dict | None,
@@ -245,7 +378,7 @@ def main() -> None:
     args = parse_args()
     frames = [args.frame] if args.frame is not None else args.frames
 
-    if args.interactive:
+    if args.interactive and args.format == "png":
         matplotlib.use("qtagg")
 
     output_dir = args.output_dir
@@ -253,12 +386,13 @@ def main() -> None:
         output_dir = args.recon_dir.parent / "viz_sh"
 
     title_prefix = args.title + " — " if args.title else ""
+    ext = "html" if args.format == "html" else "png"
 
     if args.interactive:
         print(f"Opening interactive windows for frames: {frames}")
     else:
         output_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Saving PNGs to {output_dir}")
+        print(f"Saving {ext.upper()}s to {output_dir}")
 
     for frame in frames:
         print(f"\nFrame {frame}:")
@@ -268,24 +402,26 @@ def main() -> None:
 
         voxel_data = load_voxel_frame(args.recon_dir, frame) if args.show_voxels else None
 
-        out_path = None
-        if output_dir is not None:
-            out_path = output_dir / f"sh_bubbles_frame_{frame:06d}.png"
+        out_path = output_dir / f"sh_bubbles_frame_{frame:06d}.{ext}"
 
-        visualize_frame(
-            sh_data,
-            voxel_data,
-            frame,
-            out_path,
-            show_voxels=args.show_voxels,
-            title_prefix=title_prefix,
-        )
+        if args.format == "html":
+            visualize_frame_html(
+                sh_data, voxel_data, frame, out_path,
+                show_voxels=args.show_voxels,
+                title_prefix=title_prefix,
+            )
+        else:
+            visualize_frame(
+                sh_data, voxel_data, frame, out_path,
+                show_voxels=args.show_voxels,
+                title_prefix=title_prefix,
+            )
 
-    if not args.interactive:
-        print(f"\nDone — {len(frames)} frames visualized in {output_dir}")
-    else:
+    if args.interactive and args.format == "png":
         print("\nClose figure windows to exit.")
         plt.show()
+    else:
+        print(f"\nDone — {len(frames)} frames saved to {output_dir}")
 
 
 if __name__ == "__main__":
