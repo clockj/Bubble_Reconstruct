@@ -251,6 +251,45 @@ def parse_args() -> argparse.Namespace:
         help="Coordinate-descent passes for silhouette matching.",
     )
     parser.add_argument(
+        "--sh-spectral-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Anti-flower spectral penalty: adds (l-2)^2 * WEIGHT L2 penalty on "
+            "SH terms with l>=3 (l<=2 unpenalized). Suppresses high-frequency "
+            "'flower petals'; keep modest (~1.0). Default 0 (off)."
+        ),
+    )
+    parser.add_argument(
+        "--sh-curvature-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Bending-energy penalty [l(l+1)]^2 * WEIGHT (P2/P3). Largely "
+            "redundant with --sh-spectral-weight at degree<=4. Default 0 (off)."
+        ),
+    )
+    parser.add_argument(
+        "--sh-convexity-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Convexity prior (P4): blend the fitted radius toward the surface's "
+            "own convex hull to fill concave dents. 0=off, 1=fully convex. "
+            "Benchmarked as the best single accuracy/IoU gain; try 0.5."
+        ),
+    )
+    parser.add_argument(
+        "--sh-init",
+        choices=["lstsq", "ellipsoid"],
+        default="lstsq",
+        help=(
+            "SH initialization. 'ellipsoid' seeds from the PCA ellipsoid; note "
+            "it is a no-op for the closed-form/inscribed fit (kept for future "
+            "iterative optimizers). Default 'lstsq'."
+        ),
+    )
+    parser.add_argument(
         "--sh-min-points-per-coeff",
         type=float,
         default=3.0,
@@ -290,6 +329,40 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Zero saturated border bands in the masks before reconstruction "
             "(removes segmentation border artifacts that create edge phantoms)."
+        ),
+    )
+    # ── Bubble separation ───────────────────────────────────────────────────
+    parser.add_argument(
+        "--separation",
+        choices=["shell", "filled", "watershed"],
+        default="watershed",
+        help=(
+            "How to split the combined hull into bubbles. 'shell' (legacy) "
+            "labels the eroded 1-voxel skin and can fragment a solid bubble "
+            "into slivers ('dumbbell' artifacts) or merge adjacent ones. "
+            "'filled' labels the solid volume (stable, no fragmentation). "
+            "'watershed' also splits touching bubbles at their necks. "
+            "Default 'watershed'."
+        ),
+    )
+    parser.add_argument(
+        "--min-bubble-voxels",
+        type=int,
+        default=3,
+        help=(
+            "Drop separated components smaller than this many coarse voxels "
+            "(removes 1-2 voxel sliver fragments that get a degenerate SH fit). "
+            "Kept small so real small bubbles survive — use --size-range for a "
+            "physical lower bound. Set 0 to keep all. Default 3."
+        ),
+    )
+    parser.add_argument(
+        "--watershed-min-distance",
+        type=int,
+        default=2,
+        help=(
+            "Min distance-transform depth (coarse voxels) for a watershed seed "
+            "when --separation watershed. Higher = fewer splits. Default 2."
         ),
     )
     return parser.parse_args()
@@ -583,6 +656,10 @@ def _fit_sh_for_bubbles(
             inscribed=bool(sh_config.inscribed),
             overshoot_weight=float(sh_config.overshoot_weight),
             inscribed_iters=int(sh_config.inscribed_iters),
+            spectral_weight=float(sh_config.spectral_weight),
+            curvature_weight=float(sh_config.curvature_weight),
+            convexity_weight=float(sh_config.convexity_weight),
+            init_mode=str(sh_config.init_mode),
         )
 
         try:
@@ -733,6 +810,9 @@ def reconstruct_single_frame(
     silhouette_optimize: bool = False,
     silhouette_scale: int = 4,
     silhouette_passes: int = 5,
+    separation_mode: str = "shell",
+    min_bubble_voxels: int = 0,
+    watershed_min_distance: int = 2,
 ) -> dict:
     """Reconstruct a single frame and return a result summary dict.
 
@@ -816,12 +896,15 @@ def reconstruct_single_frame(
             "completed": True, "sh_saved": False,
         }
 
-    # ── Surface components ─────────────────────────────────────────────────
+    # ── Surface components (bubble separation) ─────────────────────────────
     surface_components = find_surface_components(
         coarse_result.voxel_volume,
         coarse_result.grid_x,
         coarse_result.grid_y,
         coarse_result.grid_z,
+        mode=separation_mode,
+        min_component_voxels=min_bubble_voxels,
+        watershed_min_distance=watershed_min_distance,
     )
 
     image_resolution = np.array([real_images.shape[1], real_images.shape[0]], dtype=np.float64)
@@ -979,6 +1062,10 @@ def main() -> None:
             phi_samples=args.sh_phi_samples,
             inscribed=args.sh_inscribed,
             overshoot_weight=args.sh_overshoot_weight,
+            spectral_weight=args.sh_spectral_weight,
+            curvature_weight=args.sh_curvature_weight,
+            convexity_weight=args.sh_convexity_weight,
+            init_mode=args.sh_init,
         )
 
     config = {
@@ -1009,6 +1096,9 @@ def main() -> None:
         "size_range_mm": list(size_range) if size_range else None,
         "max_aspect_ratio": args.max_aspect_ratio,
         "clean_mask_border": args.clean_mask_border,
+        "separation_mode": args.separation,
+        "min_bubble_voxels": args.min_bubble_voxels,
+        "watershed_min_distance": args.watershed_min_distance,
         "sh_silhouette": args.sh_silhouette,
         "sh_silhouette_scale": args.sh_silhouette_scale if args.sh_silhouette else None,
         "sh_silhouette_passes": args.sh_silhouette_passes if args.sh_silhouette else None,
@@ -1057,6 +1147,9 @@ def main() -> None:
         silhouette_optimize=args.sh_silhouette,
         silhouette_scale=args.sh_silhouette_scale,
         silhouette_passes=args.sh_silhouette_passes,
+        separation_mode=args.separation,
+        min_bubble_voxels=args.min_bubble_voxels,
+        watershed_min_distance=args.watershed_min_distance,
     )
 
     if workers > 1:

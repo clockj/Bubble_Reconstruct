@@ -37,8 +37,13 @@ class SphericalHarmonicFitConfig:
     inscribed: bool = False
     overshoot_weight: float = 50.0
     inscribed_iters: int = 20
+    # ── Phase 1 / 3 additions ─────────────────────────────────────────────
+    spectral_weight: float = 0.0      # (l-2)^2 penalty on l>=3 (anti-flower)
+    curvature_weight: float = 0.0     # [l(l+1)]^2 bending-energy penalty (P2/P3)
+    convexity_weight: float = 0.0     # blend toward convex hull, fills dents (P4)
+    init_mode: str = "lstsq"          # "lstsq" | "ellipsoid" warm start
 
-    def to_dict(self) -> dict[str, float | int]:
+    def to_dict(self) -> dict[str, float | int | str]:
         return {
             "max_degree": int(self.max_degree),
             "regularization": float(self.regularization),
@@ -54,6 +59,10 @@ class SphericalHarmonicFitConfig:
             "inscribed": bool(self.inscribed),
             "overshoot_weight": float(self.overshoot_weight),
             "inscribed_iters": int(self.inscribed_iters),
+            "spectral_weight": float(self.spectral_weight),
+            "curvature_weight": float(self.curvature_weight),
+            "convexity_weight": float(self.convexity_weight),
+            "init_mode": str(self.init_mode),
         }
 
 
@@ -104,13 +113,52 @@ def _design_matrix(theta: np.ndarray, phi: np.ndarray, terms: list[tuple[int, in
     )
 
 
-def _fit_coefficients(design: np.ndarray, radius: np.ndarray, regularization: float) -> np.ndarray:
-    lam = max(float(regularization), 0.0)
-    if lam <= 0.0:
-        coefficients, *_ = np.linalg.lstsq(design, radius, rcond=None)
-        return coefficients.astype(np.float64, copy=False)
+def _penalty_diagonal(
+    terms: list[tuple[int, int]],
+    regularization: float,
+    spectral_weight: float = 0.0,
+    curvature_weight: float = 0.0,
+) -> np.ndarray:
+    """Per-coefficient L2 penalty (lambda_k) folded into the linear fit.
 
-    augmented_design = np.vstack((design, np.sqrt(lam) * np.eye(design.shape[1], dtype=np.float64)))
+    Combines three linear priors on the SH coefficients:
+      - base Tikhonov ``regularization`` on every term (R1 baseline),
+      - spectral ``spectral_weight * max(l-2, 0)^2`` on l>=3 (anti-flower, R1),
+      - bending energy ``curvature_weight * [l(l+1)]^2`` (P2/P3 — for a radial
+        SH surface, mean-curvature roughness lives in the high-l band, so
+        curvature uniformity / max-curvature reduce to a high-l penalty).
+
+    ``l=0,1,2`` (sphere / translation / ellipsoid) carry no spectral or
+    curvature penalty, so genuine low-order shape is never suppressed.
+    """
+    base = max(float(regularization), 0.0)
+    sw = max(float(spectral_weight), 0.0)
+    cw = max(float(curvature_weight), 0.0)
+    diag = np.empty(len(terms), dtype=np.float64)
+    for k, (l, _m) in enumerate(terms):
+        diag[k] = (
+            base
+            + sw * float(max(l - 2, 0)) ** 2
+            + cw * float(l * (l + 1)) ** 2
+        )
+    return diag
+
+
+def _fit_coefficients(
+    design: np.ndarray,
+    radius: np.ndarray,
+    regularization: float,
+    penalty: np.ndarray | None = None,
+) -> np.ndarray:
+    if penalty is None:
+        lam = max(float(regularization), 0.0)
+        if lam <= 0.0:
+            coefficients, *_ = np.linalg.lstsq(design, radius, rcond=None)
+            return coefficients.astype(np.float64, copy=False)
+        penalty = np.full(design.shape[1], lam, dtype=np.float64)
+
+    sqrt_pen = np.sqrt(np.maximum(penalty, 0.0))
+    augmented_design = np.vstack((design, np.diag(sqrt_pen)))
     augmented_radius = np.concatenate((radius, np.zeros(design.shape[1], dtype=np.float64)))
     coefficients, *_ = np.linalg.lstsq(augmented_design, augmented_radius, rcond=None)
     return coefficients.astype(np.float64, copy=False)
@@ -142,6 +190,8 @@ def _fit_coefficients_inscribed(
     regularization: float,
     overshoot_weight: float,
     iters: int,
+    penalty: np.ndarray | None = None,
+    warm_start: np.ndarray | None = None,
 ) -> np.ndarray:
     """Fit SH coefficients so the surface stays *inside* the hull samples.
 
@@ -155,11 +205,16 @@ def _fit_coefficients_inscribed(
     equations with the currently-overshooting samples up-weighted, pulling
     the surface down until it hugs the inner side of the hull boundary.
     """
-    lam = max(float(regularization), 0.0)
     n_coeff = design.shape[1]
-    gram = design.T @ design + lam * np.eye(n_coeff, dtype=np.float64)
+    if penalty is None:
+        lam = max(float(regularization), 0.0)
+        penalty = np.full(n_coeff, lam, dtype=np.float64)
+    gram = design.T @ design + np.diag(np.maximum(penalty, 0.0))
     rhs = design.T @ radius
-    coefficients = _fit_coefficients(design, radius, regularization)  # LS warm start
+    if warm_start is not None and warm_start.shape[0] == n_coeff:
+        coefficients = np.asarray(warm_start, dtype=np.float64).copy()
+    else:
+        coefficients = _fit_coefficients(design, radius, regularization, penalty)
 
     w = max(float(overshoot_weight), 0.0)
     for _ in range(max(int(iters), 0)):
@@ -347,6 +402,132 @@ def _grid_vertices_faces(
     return np.asarray(vertices, dtype=np.float64), np.asarray(faces, dtype=np.int64)
 
 
+def _ellipsoid_warm_start(
+    points: np.ndarray, center: np.ndarray, terms: list[tuple[int, int]],
+    penalty: np.ndarray,
+) -> np.ndarray:
+    """Degree<=2 SH coefficients of the PCA ellipsoid through the points.
+
+    Gives the fit a physically sensible starting shape (sphere + ellipsoid
+    deformation) instead of a flat sphere, which matters for the inscribed
+    IRLS and the convexity refit.
+    """
+    shifted = np.asarray(points, dtype=np.float64) - np.asarray(center, dtype=np.float64)
+    cov = np.cov(shifted.T)
+    evals, evecs = np.linalg.eigh(cov)
+    evals = np.maximum(evals, 1e-9)
+    # Scale semi-axes so the mean radius matches the data's mean radius.
+    axes = np.sqrt(evals)
+    axes *= float(np.mean(np.linalg.norm(shifted, axis=1))) / float(np.mean(axes))
+    # Radius of that ellipsoid along each data direction.
+    dist = np.maximum(np.linalg.norm(shifted, axis=1), 1e-12)
+    dirs = shifted / dist[:, None]
+    local = dirs @ evecs  # into ellipsoid-aligned frame
+    denom = np.sqrt(np.sum((local / axes[None, :]) ** 2, axis=1))
+    r_ell = 1.0 / np.maximum(denom, 1e-12)
+    _, theta, phi = _cartesian_to_spherical(points, center)
+    design = _design_matrix(theta, phi, terms)
+    # Only fit l<=2 terms; zero the rest.
+    mask_low = np.array([l <= 2 for (l, _m) in terms])
+    coeffs = np.zeros(len(terms), dtype=np.float64)
+    if np.any(mask_low):
+        coeffs[mask_low] = _fit_coefficients(
+            design[:, mask_low], r_ell, 0.0, penalty[mask_low]
+        )
+    return coeffs
+
+
+def _hull_radius_along(hull, center: np.ndarray, dirs: np.ndarray) -> np.ndarray:
+    """Ray/convex-hull intersection distance from *center* along each dir.
+
+    hull.equations give rows [a | b] with ``a·x + b <= 0`` inside.  For the
+    ray ``center + t d`` the surface is the smallest positive t that hits a
+    bounding face.
+    """
+    eq = hull.equations  # (F, 4): [nx, ny, nz, offset]
+    a = eq[:, :3]
+    b = eq[:, 3]
+    ac = a @ center + b            # (F,)  a·center + b  (<0 inside)
+    ad = dirs @ a.T                # (N, F) a·d
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = -ac[None, :] / ad      # candidate distances to each face
+    t[ad <= 1e-12] = np.inf        # only faces the ray exits through
+    t[t <= 0] = np.inf
+    return np.min(t, axis=1)
+
+
+def _apply_convexity(
+    coefficients: np.ndarray, center: np.ndarray, terms: list[tuple[int, int]],
+    design: np.ndarray, radius: np.ndarray, theta: np.ndarray, phi: np.ndarray,
+    penalty: np.ndarray, config: SphericalHarmonicFitConfig,
+) -> np.ndarray:
+    """Blend the fitted radius toward the surface's own convex hull (P4).
+
+    A convex hull fills concave dents, so moving the radius toward the hull
+    radius (only where the hull is *outside* the current surface) removes
+    saddle regions.  Weight 0 -> unchanged, 1 -> fully convex hull.
+    """
+    from scipy.spatial import ConvexHull
+
+    w = float(config.convexity_weight)
+    if w <= 0.0:
+        return coefficients
+    verts, _ = _grid_vertices_faces(center, coefficients, terms, config)
+    if verts.shape[0] < 5:
+        return coefficients
+    try:
+        hull = ConvexHull(verts)
+    except Exception:
+        return coefficients
+    dist = np.maximum(np.linalg.norm(
+        np.column_stack((np.sin(theta) * np.cos(phi),
+                         np.sin(theta) * np.sin(phi),
+                         np.cos(theta))), axis=1), 1e-12)
+    dirs = np.column_stack((np.sin(theta) * np.cos(phi),
+                            np.sin(theta) * np.sin(phi),
+                            np.cos(theta))) / dist[:, None]
+    r_hull = _hull_radius_along(hull, np.asarray(center, dtype=np.float64), dirs)
+    r_fit = design @ coefficients
+    fill = np.maximum(r_hull - r_fit, 0.0)
+    fill[~np.isfinite(fill)] = 0.0
+    r_target = r_fit + w * fill
+    return _fit_coefficients(design, r_target, config.regularization, penalty)
+
+
+def surface_curvature_stats(
+    center: np.ndarray, coefficients: np.ndarray, terms: list[tuple[int, int]],
+    config: SphericalHarmonicFitConfig | None = None,
+) -> dict[str, float]:
+    """Report-only shape descriptors: high-l bending energy + concavity.
+
+    - ``bending_energy``: sum([l(l+1)]^2 c^2) / sum(c^2), a scale-free measure
+      of mean-curvature roughness (0 for a sphere, grows with wrinkling).
+    - ``concavity_fraction``: fraction of surface vertices lying strictly
+      inside their own convex hull (0 for a convex shape).
+    """
+    settings = config or SphericalHarmonicFitConfig()
+    coeffs = np.asarray(coefficients, dtype=np.float64)
+    l_arr = np.array([l for (l, _m) in terms], dtype=np.float64)
+    energy = float(np.sum(coeffs ** 2))
+    bending = float(np.sum((l_arr * (l_arr + 1.0)) ** 2 * coeffs ** 2) / energy) if energy > 0 else 0.0
+
+    from scipy.spatial import ConvexHull
+    verts, _ = _grid_vertices_faces(np.asarray(center, dtype=np.float64), coeffs, terms, settings)
+    concavity = 0.0
+    if verts.shape[0] >= 5:
+        try:
+            hull = ConvexHull(verts)
+            eq = hull.equations
+            # signed distance to each face; inside-hull => all <=0.
+            sd = verts @ eq[:, :3].T + eq[:, 3]
+            depth = -np.max(sd, axis=1)  # >0 means strictly interior
+            tol = 1e-3 * float(np.mean(np.linalg.norm(verts - center, axis=1)))
+            concavity = float(np.mean(depth > tol))
+        except Exception:
+            concavity = 0.0
+    return {"bending_energy": bending, "concavity_fraction": concavity}
+
+
 def fit_spherical_harmonic_surface(
     vertices: np.ndarray,
     *,
@@ -363,10 +544,16 @@ def fit_spherical_harmonic_surface(
     radius, theta, phi = _cartesian_to_spherical(source_vertices, center)
     terms = _basis_terms(settings.max_degree)
     design = _design_matrix(theta, phi, terms)
+    penalty = _penalty_diagonal(
+        terms, settings.regularization,
+        settings.spectral_weight, settings.curvature_weight,
+    )
     if settings.inscribed:
         # Fit the hull's outer boundary (max radius per angular bin), then cap
         # outward overshoot, so the surface tracks the silhouette without
-        # bulging past the hull.
+        # bulging past the hull.  Note: the inscribed IRLS only pulls radii
+        # *down*, so it must start from the least-squares solution (correct
+        # scale) — an under-scaled warm start would never grow back.
         envelope = _outer_envelope_indices(theta, phi, radius)
         if envelope.size >= 2 * len(terms):
             fit_design, fit_radius = design[envelope], radius[envelope]
@@ -375,9 +562,14 @@ def fit_spherical_harmonic_surface(
         coefficients = _fit_coefficients_inscribed(
             fit_design, fit_radius, settings.regularization,
             settings.overshoot_weight, settings.inscribed_iters,
+            penalty=penalty,
         )
     else:
-        coefficients = _fit_coefficients(design, radius, settings.regularization)
+        coefficients = _fit_coefficients(design, radius, settings.regularization, penalty)
+    if settings.convexity_weight > 0.0:
+        coefficients = _apply_convexity(
+            coefficients, center, terms, design, radius, theta, phi, penalty, settings,
+        )
     silhouette_iou: float | None = None
     objective_value: float | None = None
     evaluation_count = 0
@@ -429,4 +621,5 @@ __all__ = [
     "SphericalHarmonicSurface",
     "fit_spherical_harmonic_surface",
     "fit_spherical_harmonic_surface_from_voxels",
+    "surface_curvature_stats",
 ]
