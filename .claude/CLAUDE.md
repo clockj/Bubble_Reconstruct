@@ -6,7 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Python port of a MATLAB pipeline for **3D bubble surface reconstruction from multi-view cameras** with refractive interfaces (e.g., water tanks with glass/acrylic walls). The core algorithm is **visual hull** reconstruction — intersecting viewing cones from calibrated cameras to carve out 3D voxel grids, then refining surface points, extracting per-bubble properties, and optionally fitting spherical harmonic surfaces.
 
-The pipeline is defined in `Plan.md` (a **future** 7-step design spec with PyTorch optimization) and implemented in `visual_hull/` (the **current** MATLAB port — steps 2-3 and 7 only). The `improved/` subpackage adds soft voting, mesh smoothing, and spherical harmonics fitting but does not yet implement the full Plan.md optimization framework.
+The pipeline is defined in `plans/Plan.md` (a **future** 7-step design spec with PyTorch optimization) and implemented in `visual_hull/` (the **current** MATLAB port — steps 2-3 and 7 only). The `improved/` subpackage adds soft voting, mesh smoothing, and spherical harmonics fitting but does not yet implement the full `plans/Plan.md` optimization framework.
+
+Design plans and specs live in `plans/` at the repo root — add new planning documents there.
 
 ### Production pipeline (2026-07, current)
 
