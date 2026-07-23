@@ -74,6 +74,47 @@ def load_tiff_mask(tiff_path: str | Path) -> np.ndarray:
     return gray > 0.0
 
 
+def clean_mask_border(
+    mask: np.ndarray,
+    max_edge_fraction: float = 0.15,
+    fill_threshold: float = 0.85,
+) -> np.ndarray:
+    """Zero saturated border bands (segmentation artifacts) at the image edges.
+
+    Some masks have a solid block of foreground spanning the full width/height
+    along an edge (e.g. a bright top border).  The visual hull turns these into
+    elongated phantom "bubbles".  This scans inward from each edge (up to
+    ``max_edge_fraction`` of the dimension) and clears any line whose foreground
+    fraction exceeds ``fill_threshold``, stopping at the first normal line.
+    """
+    cleaned = np.asarray(mask, dtype=bool).copy()
+    height, width = cleaned.shape
+    row_limit = int(height * max_edge_fraction)
+    col_limit = int(width * max_edge_fraction)
+
+    for row in range(row_limit):
+        if cleaned[row].mean() > fill_threshold:
+            cleaned[row] = False
+        else:
+            break
+    for row in range(height - 1, height - 1 - row_limit, -1):
+        if cleaned[row].mean() > fill_threshold:
+            cleaned[row] = False
+        else:
+            break
+    for col in range(col_limit):
+        if cleaned[:, col].mean() > fill_threshold:
+            cleaned[:, col] = False
+        else:
+            break
+    for col in range(width - 1, width - 1 - col_limit, -1):
+        if cleaned[:, col].mean() > fill_threshold:
+            cleaned[:, col] = False
+        else:
+            break
+    return cleaned
+
+
 def load_tiff_masks(
     mask_dir: str | Path,
     frame: int,

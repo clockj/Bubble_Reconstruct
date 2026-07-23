@@ -1,17 +1,30 @@
-# Debug Workflow Guidelines
+---
+name: debug-workflow
+description: Plan-first debugging and testing workflow. Use when debugging, writing test/validation scripts, or investigating a bug — plan and get approval before implementing, keep all results next to the test code, and finish with a report.
+---
 
-## Standard Testing Workflow
-1. Make a plan first and show me
-2. Wait for my review and approval before implementation. Save the plan to the testing folder
-3. When building the testing code, do not run and test other codes.
-4. During debugging and testing, save ALL results to the same folder as the test codes.
-5. Generate a final report and save it to the testing folder.
+# Debug Workflow
 
-## File Organization Rules
-- Test results must be saved in the same directory as test scripts
-- Use descriptive filenames with timestamps if needed
-- Never save results to a separate output folder
+A plan-first loop for debugging and testing. Get approval before writing code, keep every
+artifact beside the test script, and close with a report.
 
-## Code Modification Rules
-- Always explain changes before implementing
-- Wait for confirmation before proceeding to next step
+## Standard workflow
+
+1. **Plan first.** Outline the approach and show it before writing any code.
+2. **Wait for approval.** Do not implement until the plan is approved. Save the plan to the
+   testing folder.
+3. **Stay scoped.** While building the test code, do not run or modify unrelated code.
+4. **Keep results local.** Save every result — logs, plots, data — to the same folder as the
+   test code.
+5. **Report.** End with a final report saved to the testing folder.
+
+## File organization
+
+- Save test results in the **same directory** as the test scripts.
+- Use descriptive filenames, with timestamps where helpful.
+- Never write results to a separate output folder.
+
+## Code modification
+
+- Explain each change **before** implementing it.
+- Wait for confirmation before moving to the next step.

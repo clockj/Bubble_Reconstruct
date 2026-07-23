@@ -215,6 +215,42 @@ def parse_args() -> argparse.Namespace:
         help="Phi resolution for SH mesh generation.",
     )
     parser.add_argument(
+        "--sh-inscribed",
+        action="store_true",
+        help=(
+            "Constrain the SH surface to stay inside the visual hull: penalize "
+            "outward overshoot (r_SH > r_voxel) during fitting so the surface "
+            "hugs the inner side of the hull boundary instead of bulging past it."
+        ),
+    )
+    parser.add_argument(
+        "--sh-overshoot-weight",
+        type=float,
+        default=50.0,
+        help="Weight of the outward-overshoot penalty for --sh-inscribed.",
+    )
+    parser.add_argument(
+        "--sh-silhouette",
+        action="store_true",
+        help=(
+            "After fitting, optimize each bubble's SH coefficients so its "
+            "projected silhouette matches its own re-projected visual-hull "
+            "silhouette in every camera (overlap-free target)."
+        ),
+    )
+    parser.add_argument(
+        "--sh-silhouette-scale",
+        type=int,
+        default=4,
+        help="Downsample factor for the silhouette-matching optimization.",
+    )
+    parser.add_argument(
+        "--sh-silhouette-passes",
+        type=int,
+        default=5,
+        help="Coordinate-descent passes for silhouette matching.",
+    )
+    parser.add_argument(
         "--sh-min-points-per-coeff",
         type=float,
         default=3.0,
@@ -225,7 +261,7 @@ def parse_args() -> argparse.Namespace:
             "Default 3.0."
         ),
     )
-    # ── Size filtering ──────────────────────────────────────────────────────
+    # ── Size / shape filtering ──────────────────────────────────────────────
     parser.add_argument(
         "--size-range",
         type=float,
@@ -236,6 +272,24 @@ def parse_args() -> argparse.Namespace:
             "Keep only bubbles whose equivalent diameter (mm) is within "
             "[MIN, MAX]. D_eq = 2*(3V/4pi)^(1/3). Bubbles outside the range "
             "are dropped entirely (no voxels, no SH). Default: no filtering."
+        ),
+    )
+    parser.add_argument(
+        "--max-aspect-ratio",
+        type=float,
+        default=None,
+        help=(
+            "Drop bubbles whose aspect ratio (major/minor axis) exceeds this. "
+            "Removes elongated sliver phantoms. Real bubbles are ~1.5-3; "
+            "phantoms >6. Default: no filtering."
+        ),
+    )
+    parser.add_argument(
+        "--clean-mask-border",
+        action="store_true",
+        help=(
+            "Zero saturated border bands in the masks before reconstruction "
+            "(removes segmentation border artifacts that create edge phantoms)."
         ),
     )
     return parser.parse_args()
@@ -383,6 +437,75 @@ def _max_supported_sh_degree(
     return best
 
 
+def _fill_hull_silhouette(pixels: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """Filled convex-hull silhouette of projected points (bubbles are convex)."""
+    from scipy.spatial import ConvexHull
+    from skimage.draw import polygon as sk_polygon
+
+    mask = np.zeros(shape, dtype=bool)
+    if pixels.shape[0] < 3:
+        return mask
+    try:
+        hull = ConvexHull(pixels)
+    except Exception:
+        return mask
+    poly = pixels[hull.vertices]
+    rows, cols = sk_polygon(poly[:, 1], poly[:, 0], shape=shape)
+    mask[rows, cols] = True
+    return mask
+
+
+def _camera_fill(points_3d, cameras, camera_index, shape, scale):
+    projection = cameras.project_points(camera_index, points_3d)
+    pixels = projection.pixels[projection.valid] / float(scale)
+    return _fill_hull_silhouette(pixels, shape)
+
+
+def _silhouette_iou(pred: np.ndarray, target: np.ndarray) -> float:
+    inter = int(np.count_nonzero(pred & target))
+    union = int(np.count_nonzero(pred | target))
+    return 1.0 if union == 0 else inter / union
+
+
+def _optimize_coeffs_to_hull_silhouette(
+    coefficients, center, terms, opt_config, cameras, bubble_voxels,
+    image_shape, scale, passes,
+):
+    """Coordinate-descent the SH coefficients to match this bubble's own
+    re-projected hull silhouette in every camera (overlap-free target)."""
+    from visual_hull.improved.spherical_harmonics.surface import _grid_vertices_faces
+
+    ds_shape = (int(image_shape[0]) // scale, int(image_shape[1]) // scale)
+    n_cam = cameras.count
+    targets = [_camera_fill(bubble_voxels, cameras, c, ds_shape, scale) for c in range(n_cam)]
+
+    def mean_iou(coeffs):
+        verts, _ = _grid_vertices_faces(center, coeffs, terms, opt_config)
+        return float(np.mean([
+            _silhouette_iou(_camera_fill(verts, cameras, c, ds_shape, scale), targets[c])
+            for c in range(n_cam)
+        ]))
+
+    best = np.asarray(coefficients, dtype=np.float64).copy()
+    best_iou = mean_iou(best)
+    step = 0.12 * abs(best[0]) if best[0] != 0 else 0.1
+    for _ in range(int(passes)):
+        improved = False
+        for i in range(best.shape[0]):
+            for delta in (step, -step):
+                cand = best.copy()
+                cand[i] += delta
+                iou = mean_iou(cand)
+                if iou > best_iou + 1e-4:
+                    best, best_iou = cand, iou
+                    improved = True
+        if not improved:
+            step *= 0.5
+            if step < 1e-4 * (abs(best[0]) + 1e-9):
+                break
+    return best, best_iou
+
+
 def _fit_sh_for_bubbles(
     voxels: np.ndarray,
     bubbles: np.ndarray,
@@ -390,6 +513,11 @@ def _fit_sh_for_bubbles(
     *,
     adaptive_degree: bool = True,
     min_points_per_coeff: float = 3.0,
+    cameras=None,
+    image_shape: tuple[int, int] | None = None,
+    silhouette_optimize: bool = False,
+    silhouette_scale: int = 4,
+    silhouette_passes: int = 5,
 ) -> dict | None:
     """Fit spherical harmonics to each bubble's refined voxels.
 
@@ -452,6 +580,9 @@ def _fit_sh_for_bubbles(
             theta_samples=int(sh_config.theta_samples),
             phi_samples=int(sh_config.phi_samples),
             minimum_radius=float(sh_config.minimum_radius),
+            inscribed=bool(sh_config.inscribed),
+            overshoot_weight=float(sh_config.overshoot_weight),
+            inscribed_iters=int(sh_config.inscribed_iters),
         )
 
         try:
@@ -463,6 +594,31 @@ def _fit_sh_for_bubbles(
             )
         except Exception:
             continue
+
+        # ── Optional: match the re-projected per-bubble hull silhouette ─────
+        if silhouette_optimize and cameras is not None and image_shape is not None:
+            try:
+                from dataclasses import replace as _dc_replace
+                from visual_hull.improved.spherical_harmonics.surface import (
+                    _basis_terms as _bt, _grid_vertices_faces as _gvf,
+                    _cartesian_to_spherical as _c2s, _design_matrix as _dm,
+                )
+                terms_b = _bt(bubble_degree)
+                opt_cfg = SphericalHarmonicFitConfig(
+                    max_degree=bubble_degree, theta_samples=24, phi_samples=48)
+                opt_coeffs, _ = _optimize_coeffs_to_hull_silhouette(
+                    sh_surface.coefficients, sh_surface.center, terms_b, opt_cfg,
+                    cameras, bubble_voxels, image_shape,
+                    silhouette_scale, silhouette_passes)
+                final_v, final_f = _gvf(sh_surface.center, opt_coeffs, terms_b, bubble_config)
+                r_data, th, ph = _c2s(bubble_voxels, sh_surface.center)
+                fitted = np.maximum(_dm(th, ph, terms_b) @ opt_coeffs, 1e-6)
+                rmse = float(np.sqrt(np.mean((fitted - r_data) ** 2)))
+                sh_surface = _dc_replace(
+                    sh_surface, coefficients=opt_coeffs,
+                    vertices=final_v, faces=final_f, fit_rmse=rmse)
+            except Exception:
+                pass
 
         # Pad coefficients to the global max_degree for uniform storage
         n_full = (global_max_degree + 1) ** 2
@@ -572,12 +728,20 @@ def reconstruct_single_frame(
     refine_to: float | None = None,
     size_range: tuple[float, float] | None = None,
     sh_min_points_per_coeff: float = 3.0,
+    max_aspect_ratio: float | None = None,
+    clean_mask_border: bool = False,
+    silhouette_optimize: bool = False,
+    silhouette_scale: int = 4,
+    silhouette_passes: int = 5,
 ) -> dict:
     """Reconstruct a single frame and return a result summary dict.
 
     ``size_range`` — optional ``(min, max)`` equivalent-diameter bounds in
     mm.  Bubbles whose equivalent diameter falls outside the range are
     dropped entirely (excluded from voxel output and SH fitting).
+    ``max_aspect_ratio`` — optional cap; bubbles more elongated than this are
+    dropped (removes edge/border sliver phantoms).
+    ``clean_mask_border`` — zero saturated border bands in the masks first.
     """
     from visual_hull.hull import create_visual_hull
     from visual_hull.io import stack_boolean_images
@@ -597,6 +761,10 @@ def reconstruct_single_frame(
         name_template=mask_template,
         subdir_template="cam{camera}",
     )
+
+    if clean_mask_border:
+        from visual_hull.io import clean_mask_border as _clean_border
+        masks = [_clean_border(m) for m in masks]
 
     # Load cameras
     camera_paths = [
@@ -703,6 +871,12 @@ def reconstruct_single_frame(
                 filtered_out += 1
                 continue
 
+        # ── Aspect-ratio filter (drop elongated sliver phantoms) ───────────
+        # props[5] is major_mag / minor_mag.
+        if max_aspect_ratio is not None and float(props[5]) > max_aspect_ratio:
+            filtered_out += 1
+            continue
+
         all_voxels.append(voxel_list)
         bubbles.append((count + 1, count + voxel_list.shape[0]))
         properties.append(props)
@@ -747,6 +921,11 @@ def reconstruct_single_frame(
             sh_config,
             adaptive_degree=sh_adaptive,
             min_points_per_coeff=sh_min_points_per_coeff,
+            cameras=cameras,
+            image_shape=(real_images.shape[0], real_images.shape[1]),
+            silhouette_optimize=silhouette_optimize,
+            silhouette_scale=silhouette_scale,
+            silhouette_passes=silhouette_passes,
         )
         if sh_data is not None:
             sh_path = output_dir / f"Bubble_Frame_{frame:06d}_sh.mat"
@@ -786,6 +965,9 @@ def main() -> None:
             )
         size_range = (lo, hi)
 
+    if args.max_aspect_ratio is not None and args.max_aspect_ratio <= 1.0:
+        raise ValueError("--max-aspect-ratio must be > 1.0.")
+
     # ── SH config ───────────────────────────────────────────────────────────
     sh_config: SphericalHarmonicFitConfig | None = None
     sh_adaptive = not args.sh_no_adaptive
@@ -795,6 +977,8 @@ def main() -> None:
             regularization=args.sh_regularization,
             theta_samples=args.sh_theta_samples,
             phi_samples=args.sh_phi_samples,
+            inscribed=args.sh_inscribed,
+            overshoot_weight=args.sh_overshoot_weight,
         )
 
     config = {
@@ -818,9 +1002,16 @@ def main() -> None:
         "sh_max_degree": args.sh_degree if sh_config else 0,
         "sh_regularization": args.sh_regularization if sh_config else None,
         "sh_adaptive": sh_adaptive,
+        "sh_inscribed": args.sh_inscribed,
+        "sh_overshoot_weight": args.sh_overshoot_weight if args.sh_inscribed else None,
         "sh_min_points_per_coeff": args.sh_min_points_per_coeff,
         "refine_to_mm": args.refine_to,
         "size_range_mm": list(size_range) if size_range else None,
+        "max_aspect_ratio": args.max_aspect_ratio,
+        "clean_mask_border": args.clean_mask_border,
+        "sh_silhouette": args.sh_silhouette,
+        "sh_silhouette_scale": args.sh_silhouette_scale if args.sh_silhouette else None,
+        "sh_silhouette_passes": args.sh_silhouette_passes if args.sh_silhouette else None,
     }
 
     if args.dry_run:
@@ -861,6 +1052,11 @@ def main() -> None:
         refine_to=args.refine_to,
         size_range=size_range,
         sh_min_points_per_coeff=args.sh_min_points_per_coeff,
+        max_aspect_ratio=args.max_aspect_ratio,
+        clean_mask_border=args.clean_mask_border,
+        silhouette_optimize=args.sh_silhouette,
+        silhouette_scale=args.sh_silhouette_scale,
+        silhouette_passes=args.sh_silhouette_passes,
     )
 
     if workers > 1:

@@ -80,7 +80,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--match-dist-threshold", type=float, default=15.0,
-        help="Max centroid distance (mm) for matching bubbles across frames.",
+        help="Max centroid distance (mm) for nearest-neighbour matching across frames.",
+    )
+    parser.add_argument(
+        "--max-diameter-ratio", type=float, default=1.5,
+        help="Max frame-to-frame diameter ratio for a valid match "
+             "(reject if sizes differ by more than this factor).",
     )
     parser.add_argument(
         "--smooth-sigma", type=float, default=1.5,
@@ -118,13 +123,22 @@ def load_voxel_frame(recon_dir: Path, frame: int) -> dict | None:
 
 
 def bubble_features(sh_data: dict) -> np.ndarray:
-    """Extract (centroid_x, centroid_y, centroid_z, volume_approx) per bubble."""
+    """Extract (centroid_x, centroid_y, centroid_z, volume_approx) per bubble.
+
+    Size comes from the mean radius of the actual SH mesh vertices, not the
+    ``c_00`` coefficient — the c_00 formula is unreliable for inscribed /
+    silhouette-optimized coefficients (it can be off by 10x).
+    """
     centers = np.asarray(sh_data["sh_centers"])       # (B, 3)
-    coeffs = np.asarray(sh_data["sh_coefficients"])    # (B, K)
-    # Volume from c_00: V ≈ (4π/3) * (c00 * sqrt(4π))³
-    c00 = coeffs[:, 0]  # first coefficient = c_00
-    mean_radius = np.abs(c00) * np.sqrt(4.0 * np.pi)
-    volumes = (4.0 / 3.0) * np.pi * mean_radius ** 3
+    vertices = np.asarray(sh_data["sh_vertices"])      # (B, V, 3), zero-padded
+    volumes = np.zeros(centers.shape[0], dtype=np.float64)
+    for b in range(centers.shape[0]):
+        v = vertices[b]
+        v = v[np.any(v != 0.0, axis=1)]
+        if v.shape[0] == 0:
+            continue
+        mean_radius = float(np.linalg.norm(v - v.mean(axis=0), axis=1).mean())
+        volumes[b] = (4.0 / 3.0) * np.pi * mean_radius ** 3
     return np.column_stack((centers, volumes))
 
 
@@ -133,12 +147,25 @@ def bubble_features(sh_data: dict) -> np.ndarray:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _diameter_from_volume(volume: float) -> float:
+    return float((6.0 * max(volume, 1e-12) / np.pi) ** (1.0 / 3.0))
+
+
 def match_bubbles(
     feats_t: np.ndarray,
     feats_tp1: np.ndarray,
     dist_threshold: float,
+    max_diam_ratio: float = 1.5,
 ) -> tuple[list[tuple[int, int]], set[int], set[int]]:
     """Match bubbles between frame t and t+1.
+
+    Nearest-neighbour association gated by two physical constraints:
+      * centroid distance <= ``dist_threshold`` (a bubble can't teleport)
+      * diameter ratio <= ``max_diam_ratio`` (size can't jump between frames)
+    The cost is pure centroid distance, so among candidates passing both
+    gates the nearest one wins.  This prevents the identity-switches that a
+    loose distance-only gate produced (matching across 20+ mm jumps to a
+    differently-sized bubble).
 
     Returns (matched_pairs, unmatched_t, unmatched_tp1).
     """
@@ -148,13 +175,19 @@ def match_bubbles(
     if n_t == 0 or n_tp1 == 0:
         return [], set(range(n_t)), set(range(n_tp1))
 
-    # Cost matrix: centroid distance + 0.2 * volume difference
-    cost = np.full((max(n_t, n_tp1), max(n_t, n_tp1)), 1e9)
+    big = 1e9
+    cost = np.full((max(n_t, n_tp1), max(n_t, n_tp1)), big)
     for i in range(n_t):
+        d_i = _diameter_from_volume(feats_t[i, 3])
         for j in range(n_tp1):
-            d_center = np.linalg.norm(feats_t[i, :3] - feats_tp1[j, :3])
-            d_vol = abs(feats_t[i, 3] - feats_tp1[j, 3]) / max(feats_t[i, 3], 1e-6)
-            cost[i, j] = d_center + 0.2 * d_vol * dist_threshold
+            d_center = float(np.linalg.norm(feats_t[i, :3] - feats_tp1[j, :3]))
+            if d_center > dist_threshold:
+                continue  # nearest-neighbour distance gate
+            d_j = _diameter_from_volume(feats_tp1[j, 3])
+            ratio = max(d_i, d_j) / max(min(d_i, d_j), 1e-9)
+            if ratio > max_diam_ratio:
+                continue  # diameter-similarity gate
+            cost[i, j] = d_center  # pure nearest neighbour
 
     row_ind, col_ind = linear_sum_assignment(cost)
 
@@ -163,7 +196,7 @@ def match_bubbles(
     unmatched_tp1: set[int] = set(range(n_tp1))
 
     for r, c in zip(row_ind, col_ind):
-        if r < n_t and c < n_tp1 and cost[r, c] < dist_threshold:
+        if r < n_t and c < n_tp1 and cost[r, c] < big:  # passed both gates
             matched.append((r, c))
             unmatched_t.discard(r)
             unmatched_tp1.discard(c)
@@ -175,62 +208,50 @@ def build_trajectories(
     all_features: dict[int, np.ndarray],
     frames: list[int],
     dist_threshold: float,
+    max_diam_ratio: float = 1.5,
 ) -> list[dict]:
     """Build bubble trajectories across all frames.
 
     Returns list of trajectories. Each trajectory is a dict:
       {frame: bubble_index, ...} mapping frame → local bubble index.
     """
-    active: list[dict] = []  # list of trajectory dicts
+    present = [f for f in frames if all_features.get(f) is not None]
     completed: list[dict] = []
+    active: dict[int, dict] = {}  # bubble index at the current frame -> trajectory
 
-    for t_idx in range(len(frames) - 1):
-        f_t = frames[t_idx]
-        f_tp1 = frames[t_idx + 1]
-        feats_t = all_features.get(f_t)
-        feats_tp1 = all_features.get(f_tp1)
-
-        if feats_t is None or feats_tp1 is None:
-            continue
-
-        matched, unmatched_t, unmatched_tp1 = match_bubbles(
-            feats_t, feats_tp1, dist_threshold,
+    for k in range(len(present) - 1):
+        f_t, f_tp1 = present[k], present[k + 1]
+        matched, _, _ = match_bubbles(
+            all_features[f_t], all_features[f_tp1], dist_threshold, max_diam_ratio,
         )
 
-        # Update active trajectories
-        matched_t_indices = {a for a, _ in matched}
-        matched_tp1_indices = {b for _, b in matched}
+        new_active: dict[int, dict] = {}
+        matched_from: set[int] = set()
+        for a, c in matched:
+            matched_from.add(a)
+            traj = active.pop(a, None)
+            if traj is None:
+                traj = {f_t: a}  # seed a new trajectory at this match
+            traj[f_tp1] = c
+            new_active[c] = traj
 
-        new_active: list[dict] = []
-        for traj in active:
-            last_frame = max(traj.keys())
-            if last_frame != f_t:
-                # Trajectory already ended
-                completed.append(traj)
-                continue
-            b_idx = traj[last_frame]
-            if b_idx in matched_t_indices:
-                # Find the match
-                for a, c in matched:
-                    if a == b_idx:
-                        traj[f_tp1] = c
-                        new_active.append(traj)
-                        break
-            else:
-                # Lost track
-                completed.append(traj)
-
-        # Start new trajectories for unmatched in frame t
-        for b_idx in unmatched_t:
-            new_active.append({f_t: b_idx})
-
-        # Start new trajectories for unmatched in frame t+1 (appear in t+1)
-        for b_idx in unmatched_tp1:
-            new_active.append({f_tp1: b_idx})
-
+        # Trajectories whose bubble did not match end here.
+        completed.extend(active.values())
         active = new_active
 
-    completed.extend(active)
+    completed.extend(active.values())
+
+    # Cover every bubble: bubbles never placed in a trajectory become singletons.
+    covered: dict[int, set[int]] = {}
+    for traj in completed:
+        for f, b in traj.items():
+            covered.setdefault(f, set()).add(b)
+    for f in present:
+        seen = covered.get(f, set())
+        for b in range(all_features[f].shape[0]):
+            if b not in seen:
+                completed.append({f: b})
+
     return completed
 
 
@@ -284,14 +305,35 @@ def apply_temporal_smoothing(
         "sh_faces": [],
         "sh_fit_rmse": [],
         "sh_degree_used": [],
+        "sh_track_id": [],
         "sh_max_degree": 0,
     })
 
-    for traj in trajectories:
-        if len(traj) < 2:
-            continue  # single frame — no smoothing possible
-
+    for traj_id, traj in enumerate(trajectories):
         frames_in_traj = sorted(traj.keys())
+
+        if len(traj) < 2:
+            # Untracked (single-frame) bubble: pass through unsmoothed so it
+            # still appears in the output instead of being dropped.
+            f = frames_in_traj[0]
+            b = traj[f]
+            sh = all_sh.get(f)
+            if sh is None:
+                continue
+            maxd = int(np.asarray(sh["sh_max_degree"]).flat[0])
+            fd = frame_data[f]
+            fd["sh_centers"].append(np.asarray(sh["sh_centers"][b]))
+            fd["sh_coefficients"].append(np.asarray(sh["sh_coefficients"][b]))
+            fd["sh_basis_l"].append(np.array([t[0] for t in _basis_terms(maxd)], dtype=np.int32))
+            fd["sh_basis_m"].append(np.array([t[1] for t in _basis_terms(maxd)], dtype=np.int32))
+            fd["sh_vertices"].append(np.asarray(sh["sh_vertices"][b]))
+            fd["sh_faces"].append(np.asarray(sh["sh_faces"][b]))
+            fd["sh_fit_rmse"].append(float(np.asarray(sh["sh_fit_rmse"]).flatten()[b]))
+            fd["sh_degree_used"].append(int(np.asarray(sh["sh_degree_used"]).flatten()[b]))
+            fd["sh_track_id"].append(traj_id)
+            fd["sh_max_degree"] = max(fd["sh_max_degree"], maxd)
+            continue
+
         max_degree = 0
 
         # Collect coefficient sequences
@@ -355,6 +397,7 @@ def apply_temporal_smoothing(
             fd["sh_faces"].append(faces + 1)
             fd["sh_fit_rmse"].append(0.0)  # smoothed — no direct RMSE
             fd["sh_degree_used"].append(deg)
+            fd["sh_track_id"].append(traj_id)
             fd["sh_max_degree"] = max(fd["sh_max_degree"], max_degree)
 
     # Pad and stack per frame
@@ -383,6 +426,7 @@ def apply_temporal_smoothing(
             ], dtype=np.int32),
             "sh_fit_rmse": np.array([fd["sh_fit_rmse"]]),
             "sh_degree_used": np.array([fd["sh_degree_used"]], dtype=np.int32),
+            "sh_track_id": np.array([fd["sh_track_id"]], dtype=np.int32),
         }
     return result
 
@@ -694,8 +738,11 @@ def main() -> None:
     print(f"  Loaded {len(all_sh)} frames with SH data")
 
     # ── Matching ────────────────────────────────────────────────────────────
-    print(f"Matching bubbles across frames (threshold={args.match_dist_threshold} mm) ...")
-    trajectories = build_trajectories(all_features, frames, args.match_dist_threshold)
+    print(f"Matching bubbles across frames (dist<={args.match_dist_threshold} mm, "
+          f"diam ratio<={args.max_diameter_ratio}) ...")
+    trajectories = build_trajectories(
+        all_features, frames, args.match_dist_threshold, args.max_diameter_ratio
+    )
     traj_lengths = [len(t) for t in trajectories]
     print(f"  Found {len(trajectories)} trajectories")
     print(f"  Lengths: min={min(traj_lengths) if traj_lengths else 0}, "

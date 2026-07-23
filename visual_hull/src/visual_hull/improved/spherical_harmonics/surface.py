@@ -34,6 +34,9 @@ class SphericalHarmonicFitConfig:
     silhouette_step_scale: float = 0.05
     silhouette_top_k: int = 12
     coefficient_drift_weight: float = 0.1
+    inscribed: bool = False
+    overshoot_weight: float = 50.0
+    inscribed_iters: int = 20
 
     def to_dict(self) -> dict[str, float | int]:
         return {
@@ -48,6 +51,9 @@ class SphericalHarmonicFitConfig:
             "silhouette_step_scale": float(self.silhouette_step_scale),
             "silhouette_top_k": int(self.silhouette_top_k),
             "coefficient_drift_weight": float(self.coefficient_drift_weight),
+            "inscribed": bool(self.inscribed),
+            "overshoot_weight": float(self.overshoot_weight),
+            "inscribed_iters": int(self.inscribed_iters),
         }
 
 
@@ -107,6 +113,64 @@ def _fit_coefficients(design: np.ndarray, radius: np.ndarray, regularization: fl
     augmented_design = np.vstack((design, np.sqrt(lam) * np.eye(design.shape[1], dtype=np.float64)))
     augmented_radius = np.concatenate((radius, np.zeros(design.shape[1], dtype=np.float64)))
     coefficients, *_ = np.linalg.lstsq(augmented_design, augmented_radius, rcond=None)
+    return coefficients.astype(np.float64, copy=False)
+
+
+def _outer_envelope_indices(
+    theta: np.ndarray, phi: np.ndarray, radius: np.ndarray, nbins: int = 14
+) -> np.ndarray:
+    """Indices of the outermost surface point in each angular bin.
+
+    The hull voxels form a shell of finite thickness; fitting the SH to the
+    *mean* of that shell pulls the surface inward. Selecting the max-radius
+    point per (theta, phi) bin gives the hull's outer boundary, so the fit
+    tracks the silhouette rather than the shell interior.
+    """
+    ti = np.clip((theta / pi * nbins).astype(np.int64), 0, nbins - 1)
+    pj = np.clip((phi / (2.0 * pi) * nbins).astype(np.int64), 0, nbins - 1)
+    keys = ti * nbins + pj
+    chosen: list[int] = []
+    for key in np.unique(keys):
+        members = np.where(keys == key)[0]
+        chosen.append(int(members[np.argmax(radius[members])]))
+    return np.asarray(sorted(chosen), dtype=np.int64)
+
+
+def _fit_coefficients_inscribed(
+    design: np.ndarray,
+    radius: np.ndarray,
+    regularization: float,
+    overshoot_weight: float,
+    iters: int,
+) -> np.ndarray:
+    """Fit SH coefficients so the surface stays *inside* the hull samples.
+
+    Standard least squares fits the mean of the surface points, so the SH
+    radius bulges *outward* past the samples in some directions (the source
+    of both the flower petals and extra over-estimate beyond the hull).
+
+    Here we add a one-sided penalty ``w * sum(max(0, Yc - r)^2)`` that acts
+    only where the fitted radius exceeds the voxel radius, solved by
+    iteratively re-weighted least squares: each pass re-solves the normal
+    equations with the currently-overshooting samples up-weighted, pulling
+    the surface down until it hugs the inner side of the hull boundary.
+    """
+    lam = max(float(regularization), 0.0)
+    n_coeff = design.shape[1]
+    gram = design.T @ design + lam * np.eye(n_coeff, dtype=np.float64)
+    rhs = design.T @ radius
+    coefficients = _fit_coefficients(design, radius, regularization)  # LS warm start
+
+    w = max(float(overshoot_weight), 0.0)
+    for _ in range(max(int(iters), 0)):
+        overshoot = (design @ coefficients) > radius
+        if not np.any(overshoot):
+            break
+        design_over = design[overshoot]
+        radius_over = radius[overshoot]
+        lhs = gram + w * (design_over.T @ design_over)
+        b = rhs + w * (design_over.T @ radius_over)
+        coefficients = np.linalg.solve(lhs, b)
     return coefficients.astype(np.float64, copy=False)
 
 
@@ -299,7 +363,21 @@ def fit_spherical_harmonic_surface(
     radius, theta, phi = _cartesian_to_spherical(source_vertices, center)
     terms = _basis_terms(settings.max_degree)
     design = _design_matrix(theta, phi, terms)
-    coefficients = _fit_coefficients(design, radius, settings.regularization)
+    if settings.inscribed:
+        # Fit the hull's outer boundary (max radius per angular bin), then cap
+        # outward overshoot, so the surface tracks the silhouette without
+        # bulging past the hull.
+        envelope = _outer_envelope_indices(theta, phi, radius)
+        if envelope.size >= 2 * len(terms):
+            fit_design, fit_radius = design[envelope], radius[envelope]
+        else:  # too few bins for a stable envelope — use all points
+            fit_design, fit_radius = design, radius
+        coefficients = _fit_coefficients_inscribed(
+            fit_design, fit_radius, settings.regularization,
+            settings.overshoot_weight, settings.inscribed_iters,
+        )
+    else:
+        coefficients = _fit_coefficients(design, radius, settings.regularization)
     silhouette_iou: float | None = None
     objective_value: float | None = None
     evaluation_count = 0

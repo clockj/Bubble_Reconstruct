@@ -8,6 +8,44 @@ Python port of a MATLAB pipeline for **3D bubble surface reconstruction from mul
 
 The pipeline is defined in `Plan.md` (a **future** 7-step design spec with PyTorch optimization) and implemented in `visual_hull/` (the **current** MATLAB port — steps 2-3 and 7 only). The `improved/` subpackage adds soft voting, mesh smoothing, and spherical harmonics fitting but does not yet implement the full Plan.md optimization framework.
 
+### Production pipeline (2026-07, current)
+
+The live workflow runs on the 4-camera refractive dataset at
+`X:\Shijie Zhong\Bubble Shear Project\Processed\20260710\20Hz_r_b_1_lpt\` (`X:` → `\\ruisrv5.wse.jhu.edu\data`) via the `bubble-visual-hull` conda env
+(`C:\Users\zcloc\.conda\envs\bubble-visual-hull\python.exe`; invoke through PowerShell). Three stages:
+
+- **A. Per-frame reconstruction** — `scripts/reconstruct_tiff_data.py`: TIFF masks → visual hull →
+  surface refinement → per-bubble properties → optional SH surface fit. Writes
+  `Results/<name>/Bubble_Frame_*.mat` (+ `*_sh.mat`, `reconstruction_summary.json`).
+- **B. Tracking + temporal smoothing** — `scripts/temporal_smooth_sh.py`: nearest-neighbour +
+  diameter-gated matcher, Gaussian smoothing along each track, and a stable **`sh_track_id`** per
+  bubble (same physical bubble keeps its ID/color across frames).
+- **C. Visualization** — `scripts/visualize_raw_html.py` (raw voxels) and
+  `scripts/visualize_smoothed_html.py` (smoothed SH, colored by `sh_track_id`): self-contained
+  interactive Plotly HTML with a frame slider, Plotly loaded via CDN (needs internet).
+
+**Reference run (50 frames):**
+`reconstruct_tiff_data.py --frames 0 49 --voxel-size 0.5 0.5 0.5 --sh-degree 4 --sh-inscribed --sh-silhouette --max-aspect-ratio 5`.
+
+**SH surface fit** (`improved/spherical_harmonics/surface.py`) has three safeguards, all opt-in via
+flags on `reconstruct_tiff_data.py`:
+- `--sh-min-points-per-coeff` (default 3) — **flower fix**: caps each bubble's degree so an
+  undersampled fit can't oscillate into negative-radius "petals" (root cause: pts/coeff < 1).
+- `--sh-inscribed` — fits the hull's *outer envelope* with a one-sided overshoot penalty (IRLS),
+  so the surface hugs the inside of the hull boundary instead of bulging past it.
+- `--sh-silhouette` — coordinate-descends the SH coeffs to maximize IoU vs each bubble's *own
+  re-projected* hull silhouette in every camera. Raised mean IoU 0.60 → 0.86 (frame 16).
+
+**Filtering** on `reconstruct_tiff_data.py`: `--size-range MIN MAX` (equivalent diameter mm,
+`D_eq = 2·(3V/4π)^(1/3)`) and `--max-aspect-ratio` (drop elongated **visual-hull ghost** slivers;
+real bubbles ~1.5–3, phantoms >6).
+
+**Known bias:** the 4-view visual hull systematically **over-estimates ~+6% diameter / +19% volume**
+(synthetic-sphere study, `test/20260722-142124-synthetic-sphere-bias/`), independent of
+size/location/resolution. Temporal smoothing improves **precision** (jitter ~×3) but does **not**
+remove this **accuracy** bias — that needs calibration or the silhouette-consistent fit. The two are
+complementary. The latest report is `report/reconstruction_report_20260723.md`.
+
 ## Package Structure
 
 ```
@@ -34,6 +72,10 @@ visual_hull/
 │       ├── surface.py              # Laplacian/Taubin mesh smoothing + surface mesh from voxels
 │       └── spherical_harmonics/    # SH surface representation + fitting
 └── scripts/                        # Runnable entry points
+    ├── reconstruct_tiff_data.py    # PRODUCTION Stage A: TIFF masks -> voxels + SH (main entry)
+    ├── temporal_smooth_sh.py       # PRODUCTION Stage B: tracking + smoothing + sh_track_id
+    ├── visualize_raw_html.py       # PRODUCTION Stage C: raw voxel interactive HTML viewer
+    ├── visualize_smoothed_html.py  # PRODUCTION Stage C: smoothed, track-colored HTML viewer
     ├── smoke_test.py               # Quick end-to-end validation
     ├── export_frame0.py            # Single-frame reconstruction export
     ├── reconstruct_frames_parallel.py  # Multi-frame batch reconstruction
