@@ -150,6 +150,62 @@ def convex_sh(center, base_radius: float,
                            {f"{l},{m}": a for (l, m), a in deformations.items()}})
 
 
+def _rotation_matrix(alpha: float, beta: float) -> np.ndarray:
+    ca, sa, cb, sb = np.cos(alpha), np.sin(alpha), np.cos(beta), np.sin(beta)
+    return np.array([[ca * cb, -sa, ca * sb],
+                     [sa * cb,  ca, sa * sb],
+                     [-sb,     0.0, cb]])
+
+
+def _skew_matrix(r1, t1, r2, t2, r3, t3) -> np.ndarray:
+    S = np.array([[np.sqrt(1 - r1 ** 2), r2 * np.sin(t2),        r3 * np.cos(t3)],
+                  [r1 * np.cos(t1),      np.sqrt(1 - r2 ** 2),   r3 * np.sin(t3)],
+                  [r1 * np.sin(t1),      r2 * np.cos(t2),        np.sqrt(1 - r3 ** 2)]])
+    return S / np.cbrt(np.linalg.det(S))
+
+
+def joukowski_bubble(center, size: float = 0.55, a: float = 0.25, kind: str = "a",
+                     scale=(1.0, 1.0, 1.0), rot=(0.0, 0.0),
+                     skew=None) -> SyntheticShape:
+    """Analytic non-affine deformed bubble following Gong et al. (2022) / Huang
+    et al. (2025).  The canonical radial profile is the Joukowski image of a
+    circle of radius 2 shifted by ``a`` (``z -> z + 1/z``), giving a bubble-like
+    oblate profile; ``a`` controls the ellipsoid distortion.  An affine map
+    ``A = Scale·Rotation·Skew/cbrt(det Skew)`` adds rotation and the non-affine
+    (vertical/horizontal) skewness.  ``size`` scales overall to mm.
+
+    The world surface is the affine image of a star-convex radial shape, so it is
+    star-convex about ``center`` with closed-form radius
+    ``r(d) = |Jo(lat(A⁻¹d))| / ‖A⁻¹d‖`` (used as ``radial_fn``).
+    """
+    center = np.asarray(center, dtype=np.float64)
+    cparam = float(a) if kind == "a" else 1j * float(a)   # |Jo_b| == |Jo| (×i drops)
+    Scale = np.diag(np.asarray(scale, dtype=np.float64) * float(size))
+    R = _rotation_matrix(*rot)
+    S = _skew_matrix(*(skew if skew is not None else (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)))
+    A = Scale @ R @ S
+    Ainv = np.linalg.inv(A)
+
+    def fn(th, ph):
+        th = np.asarray(th, dtype=np.float64); ph = np.asarray(ph, dtype=np.float64)
+        d = np.column_stack((np.sin(th) * np.cos(ph),
+                             np.sin(th) * np.sin(ph),
+                             np.cos(th)))
+        e = d @ Ainv.T
+        ne = np.maximum(np.linalg.norm(e, axis=1), 1e-12)
+        lat = np.arctan2(e[:, 2], np.hypot(e[:, 0], e[:, 1]))
+        zc = 2.0 * np.exp(1j * lat) + cparam
+        Rprof = np.abs(zc + 1.0 / zc)
+        return Rprof / ne
+
+    vol = _radial_volume(fn)
+    axes = _principal_axes(fn)
+    return SyntheticShape("joukowski", center, fn, vol, axes,
+                          {"size": size, "a": a, "kind": kind,
+                           "scale": list(scale), "rot": list(rot),
+                           "skew": list(skew) if skew is not None else None})
+
+
 def radial_inside(points: np.ndarray, center: np.ndarray, radial_fn) -> np.ndarray:
     """Boolean inside test for a star-convex radial shape."""
     p = np.asarray(points, dtype=np.float64) - np.asarray(center, dtype=np.float64)
@@ -210,7 +266,7 @@ def corrupt_mask(mask: np.ndarray, hole_frac: float = 0.0, speckle_frac: float =
 
 
 __all__ = [
-    "SyntheticShape", "sphere", "ellipsoid", "convex_sh",
+    "SyntheticShape", "sphere", "ellipsoid", "convex_sh", "joukowski_bubble",
     "fibonacci_directions", "directions_to_angles", "radial_inside",
     "render_masks_through_cameras", "corrupt_mask",
 ]

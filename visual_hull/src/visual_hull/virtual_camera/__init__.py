@@ -15,11 +15,13 @@ from __future__ import annotations
 from .carve import VirtualCarveConfig, round_hull_occupancy
 from .round_surface import RoundedBubble, round_bubble_surface
 from .anisotropic import round_bubble_surface_anisotropic
+from .silhouette_refine import refine_bubble_silhouette, RefineConfig
 from .views import virtual_directions, orthonormal_basis, viewing_directions
 
 __all__ = [
     "round_bubble_surface", "RoundedBubble",
     "round_bubble_surface_anisotropic",
+    "refine_bubble_silhouette", "RefineConfig",
     "round_hull_occupancy", "VirtualCarveConfig",
     "virtual_directions", "orthonormal_basis", "viewing_directions",
 ]
