@@ -300,6 +300,20 @@ def parse_args() -> argparse.Namespace:
             "Default 3.0."
         ),
     )
+    # ── Surface representation ──────────────────────────────────────────────
+    parser.add_argument(
+        "--surface",
+        choices=["none", "tier1"],
+        default="none",
+        help=(
+            "Extra surface representation written as a sidecar per frame. "
+            "'none' = voxels only. 'tier1' = virtual-camera Tier-1 rounding "
+            "(Bézier silhouette smoothing + real-camera reprojection gate); "
+            "de-boxes the 4-view hull into a smooth bubble mesh. Writes "
+            "Bubble_Frame_XXXXXX_tier1.mat (icosphere meshes + size props). "
+            "Benchmark-best for volume/diameter accuracy. Default 'none'."
+        ),
+    )
     # ── Size / shape filtering ──────────────────────────────────────────────
     parser.add_argument(
         "--size-range",
@@ -737,6 +751,77 @@ def _fit_sh_for_bubbles(
     }
 
 
+def _tier1_surface_for_bubbles(
+    bubble_point_list: list[np.ndarray],
+    cameras: OpenLPTCameraSet,
+    fine_voxel_size: float,
+) -> dict | None:
+    """Virtual-camera Tier-1 surface for each retained bubble.
+
+    Runs the Bézier-smoothed, reprojection-gated rounding
+    (``refine_bubble_silhouette``) on every bubble's refined voxel cloud and
+    returns fixed-topology icosphere meshes plus size properties, saved as a
+    sidecar analogous to the SH output.  Uses the benchmark-best settings
+    (omega=0.6, area_tol=0.15, gate_mode="hull3d").
+    """
+    from visual_hull.virtual_camera import refine_bubble_silhouette, RefineConfig
+    from visual_hull.mesh_surface.mesh_ops import face_normals_areas
+
+    sp = max(float(fine_voxel_size), 1e-3)
+    cfg = RefineConfig(
+        spacing=sp, input_pitch=sp, n_virtual=26, omega=0.6,
+        area_tol=0.15, iters=2, gate_mode="hull3d",
+    )
+
+    centers: list[np.ndarray] = []
+    verts: list[np.ndarray] = []
+    faces: list[np.ndarray] = []
+    vols: list[float] = []
+    diams: list[float] = []
+    areas: list[float] = []
+
+    for pts in bubble_point_list:
+        if pts is None or pts.shape[0] < 8:
+            continue
+        try:
+            rb = refine_bubble_silhouette(
+                pts, cameras, None, voxel_size=sp, config=cfg
+            )
+        except Exception:
+            continue
+        if rb is None:
+            continue
+        m = rb.mesh
+        _, a = face_normals_areas(m.vertices, m.faces)
+        centers.append(m.center)
+        verts.append(m.vertices)
+        faces.append(m.faces + 1)  # 0-index → 1-index (MATLAB)
+        vols.append(float(m.volume))
+        diams.append(float(m.equiv_diameter))
+        areas.append(float(a.sum()))
+
+    if not centers:
+        return None
+
+    vmax = max(v.shape[0] for v in verts)
+    fmax = max(f.shape[0] for f in faces)
+    return {
+        "tier1_num_bubbles": len(centers),
+        "tier1_centers": np.array(centers, dtype=np.float64),
+        "tier1_vertices": np.array(
+            [np.pad(v, ((0, vmax - v.shape[0]), (0, 0))) for v in verts],
+            dtype=np.float64,
+        ),
+        "tier1_faces": np.array(
+            [np.pad(f, ((0, fmax - f.shape[0]), (0, 0))) for f in faces],
+            dtype=np.int32,
+        ),
+        "tier1_volume": np.array(vols, dtype=np.float64),
+        "tier1_equiv_diameter": np.array(diams, dtype=np.float64),
+        "tier1_surface_area": np.array(areas, dtype=np.float64),
+    }
+
+
 def _multi_level_refine(
     surface_points: np.ndarray,
     coarse_voxel_size: np.ndarray,
@@ -813,6 +898,7 @@ def reconstruct_single_frame(
     separation_mode: str = "shell",
     min_bubble_voxels: int = 0,
     watershed_min_distance: int = 2,
+    surface_mode: str = "none",
 ) -> dict:
     """Reconstruct a single frame and return a result summary dict.
 
@@ -912,6 +998,7 @@ def reconstruct_single_frame(
     all_voxels: list[np.ndarray] = []
     bubbles: list[tuple[int, int]] = []
     properties: list[np.ndarray] = []
+    tier1_inputs: list[np.ndarray] = []  # per-bubble refined points (tier1 only)
     count = 0
     filtered_out = 0
 
@@ -963,6 +1050,8 @@ def reconstruct_single_frame(
         all_voxels.append(voxel_list)
         bubbles.append((count + 1, count + voxel_list.shape[0]))
         properties.append(props)
+        if surface_mode == "tier1":
+            tier1_inputs.append(refined_points)
         count += voxel_list.shape[0]
 
     final_voxels = np.vstack(all_voxels) if all_voxels else np.empty((0, 3), dtype=np.float64)
@@ -1017,6 +1106,19 @@ def reconstruct_single_frame(
             summary["sh_saved"] = True
             summary["sh_num_bubbles"] = sh_data["sh_num_bubbles"]
             summary["sh_fit_rmse_mean"] = float(np.mean(sh_data["sh_fit_rmse"]))
+
+    # ── Virtual-camera Tier-1 surface (optional) ────────────────────────────
+    summary["tier1_saved"] = False
+    if surface_mode == "tier1" and tier1_inputs:
+        tier1_data = _tier1_surface_for_bubbles(
+            tier1_inputs, cameras, float(np.min(fine_voxel_size))
+        )
+        if tier1_data is not None:
+            tier1_path = output_dir / f"Bubble_Frame_{frame:06d}_tier1.mat"
+            savemat(str(tier1_path), tier1_data)
+            summary["tier1_output"] = str(tier1_path)
+            summary["tier1_saved"] = True
+            summary["tier1_num_bubbles"] = tier1_data["tier1_num_bubbles"]
 
     return summary
 
@@ -1099,6 +1201,7 @@ def main() -> None:
         "separation_mode": args.separation,
         "min_bubble_voxels": args.min_bubble_voxels,
         "watershed_min_distance": args.watershed_min_distance,
+        "surface": args.surface,
         "sh_silhouette": args.sh_silhouette,
         "sh_silhouette_scale": args.sh_silhouette_scale if args.sh_silhouette else None,
         "sh_silhouette_passes": args.sh_silhouette_passes if args.sh_silhouette else None,
@@ -1120,6 +1223,7 @@ def main() -> None:
     print(f"Limits      : {args.limits} mm")
     print(f"Cameras     : {args.num_cameras}")
     print(f"Workers     : {workers}  (of {_cpu_count()} CPUs)")
+    print(f"Surface     : {args.surface}")
     print(f"SH degree   : {args.sh_degree}" + (" (disabled)" if args.sh_degree == 0 else ""))
     if args.sh_degree > 0:
         print(f"SH min pts/coeff : {args.sh_min_points_per_coeff}")
@@ -1150,6 +1254,7 @@ def main() -> None:
         separation_mode=args.separation,
         min_bubble_voxels=args.min_bubble_voxels,
         watershed_min_distance=args.watershed_min_distance,
+        surface_mode=args.surface,
     )
 
     if workers > 1:
@@ -1168,7 +1273,9 @@ def main() -> None:
                 results.append(r)
                 extra = ""
                 if r.get("sh_saved"):
-                    extra = f", SH RMSE={r['sh_fit_rmse_mean']:.3f}"
+                    extra += f", SH RMSE={r['sh_fit_rmse_mean']:.3f}"
+                if r.get("tier1_saved"):
+                    extra += f", tier1={r['tier1_num_bubbles']} bubbles"
                 print(f"OK — {r['voxel_count']} voxels, {r['bubble_count']} bubbles{extra}")
             except Exception as exc:
                 print(f"FAILED — {exc}")
@@ -1191,10 +1298,12 @@ def main() -> None:
         total_voxels = sum(r["voxel_count"] for r in completed)
         total_bubbles = sum(r["bubble_count"] for r in completed)
         sh_count = sum(1 for r in completed if r.get("sh_saved"))
+        tier1_count = sum(1 for r in completed if r.get("tier1_saved"))
         total_filtered = sum(r.get("filtered_out_of_size_range", 0) for r in completed)
         print(f"Total voxels  : {total_voxels}")
         print(f"Total bubbles : {total_bubbles}")
         print(f"SH fitted     : {sh_count} frames")
+        print(f"Tier-1 surface: {tier1_count} frames")
         if size_range is not None:
             print(f"Filtered out  : {total_filtered} bubbles (outside {size_range[0]}–{size_range[1]} mm)")
 
